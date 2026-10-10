@@ -21,7 +21,7 @@ Claude 工作时，输入框上方还会多出一行横幅，显示当前工具�
 
 ## 环境要求
 
-- Claude Code 2.1.293 或更新版本（开发和测试都在这个版本上进行）
+- Claude Code 2.1.293 或更新版本（开发和测试都在这个版本上进行），终端和 Claude Desktop 都能用
 - 终端使用 [Nerd Font](https://www.nerdfonts.com/) 字体，否则图标无法显示（开发环境为 Windows Terminal + MartianMono Nerd Font）
 
 ## 安装
@@ -36,7 +36,8 @@ Claude 工作时，输入框上方还会多出一行横幅，显示当前工具�
 
 ## 使用
 
-- 终端宽度达到 144 列时，面板会自动打开
+- 在终端里，窗口宽度达到 144 列时面板会自动打开
+- 在 Claude Desktop 里，开启对话后面板会自动打开
 - 任何宽度下都可以用 `/panel` 打开或关闭面板
 - 面板里的按钮可以隐藏或显示输入框上方的横幅
 
@@ -52,6 +53,10 @@ Claude 工作时，输入框上方还会多出一行横幅，显示当前工具�
   "command": "bash \"$HOME/.claude/statusline-command.sh\""
 }
 ```
+
+## 已知问题
+
+- 在 Claude Desktop 里，侧边栏面板和输入框上方横幅中的 Nerd Font 图标无法正确显示
 
 ## 开发
 

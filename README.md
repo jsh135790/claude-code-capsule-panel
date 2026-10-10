@@ -21,7 +21,7 @@ Plus a one-line band above the prompt while Claude is working: the current tool,
 
 ## Requirements
 
-- Claude Code 2.1.293 or later (developed and tested on that build)
+- Claude Code 2.1.293 or later (developed and tested on that build), in the terminal or in Claude Desktop
 - A [Nerd Font](https://www.nerdfonts.com/) in your terminal for the icons (developed with MartianMono Nerd Font in Windows Terminal)
 
 ## Install
@@ -36,7 +36,8 @@ Answer `y` to add the marketplace, then press Enter to install for your user. It
 
 ## Usage
 
-- The pane opens by itself when the terminal is at least 144 columns wide
+- In the terminal, the pane opens by itself when the window is at least 144 columns wide
+- In Claude Desktop, the pane opens by itself when a conversation starts
 - `/panel` opens or closes it at any width
 - The button in the pane hides or shows the band above the prompt
 
@@ -52,6 +53,10 @@ Copy it to `~/.claude/statusline-command.sh` and add this to `~/.claude/settings
   "command": "bash \"$HOME/.claude/statusline-command.sh\""
 }
 ```
+
+## Known issues
+
+- In Claude Desktop, the Nerd Font icons in the side pane and the activity band don't display correctly
 
 ## Development
 
