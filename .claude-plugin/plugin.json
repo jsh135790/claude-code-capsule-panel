@@ -1,0 +1,11 @@
+{
+  "name": "capsule-panel",
+  "version": "0.2.0",
+  "description": "Live usage dashboard: context, cache, rate limits, cost and activity in a capsule-style pane.",
+  "author": { "name": "jsh135790" },
+  "homepage": "https://github.com/jsh135790/claude-code-capsule-panel",
+  "repository": "https://github.com/jsh135790/claude-code-capsule-panel",
+  "license": "MIT",
+  "keywords": ["dashboard", "usage", "context", "rate-limit", "catppuccin", "nerd-fonts"],
+  "types": "./types/index.d.ts"
+}

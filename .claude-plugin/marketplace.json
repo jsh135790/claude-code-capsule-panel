@@ -1,0 +1,14 @@
+{
+  "name": "capsule-panel",
+  "owner": { "name": "jsh135790" },
+  "metadata": {
+    "description": "A live usage dashboard for Claude Code, in a Catppuccin capsule-style side pane."
+  },
+  "plugins": [
+    {
+      "name": "capsule-panel",
+      "source": "./",
+      "description": "Live usage dashboard: context, cache, rate limits, cost and activity in a capsule-style pane."
+    }
+  ]
+}
