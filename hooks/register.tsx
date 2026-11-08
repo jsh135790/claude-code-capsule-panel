@@ -4,8 +4,10 @@ import type {
   ButtonProps,
   ElementConstructor,
   EngineInterface,
+  PluginOptions,
   Register,
   RenderNode,
+  SvgProps,
   TextProps,
   Timer,
 } from 'claude-code'
@@ -40,6 +42,8 @@ const SAMPLE_EVERY_MS = 5 * 60_000
 const BURN_WINDOW_MS = 30 * 60_000
 const BURN_MIN_SPAN_MS = 5 * 60_000
 const CHARS_PER_TOKEN = 3.5
+const TOAST_MS = 8_000
+const DONE_SOUND = 'assets/done.wav'
 // tools that can change the work tree, and tools that start subagents (older builds name it Task)
 const GIT_TOOLS: ReadonlySet<string> = new Set(['Bash', 'PowerShell', 'Edit', 'Write', 'NotebookEdit'])
 const AGENT_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task'])
@@ -66,8 +70,20 @@ const C = {
   red: '#f38ba8',
 } as const
 
+// ── options ───────────────────────────────────────────────────────────────
+
+type IconChoice = 'auto' | 'nerd' | 'unicode'
+type Options = { icons: IconChoice; isSoundOn: boolean }
+
+const parseOptions = (o: PluginOptions): Options => ({
+  icons: o.icons === 'nerd' || o.icons === 'unicode' ? o.icons : 'auto',
+  isSoundOn: o.sound !== false,
+})
+
+// ── icons ─────────────────────────────────────────────────────────────────
+
 // Nerd Font glyphs, each checked against MartianMono Nerd Font's cmap.
-const I = {
+const NERD = {
   capL: '\ue0b6',
   capR: '\ue0b4',
   sparkle: '\u{f0674}',
@@ -91,7 +107,55 @@ const I = {
   wrench: '\uf0ad',
 } as const
 
-const PIE = ['\u{f0a9e}', '\u{f0a9f}', '\u{f0aa0}', '\u{f0aa1}', '\u{f0aa2}', '\u{f0aa3}', '\u{f0aa4}', '\u{f0aa5}']
+type IconSet = { readonly [K in keyof typeof NERD]: string }
+
+// Plain Unicode symbols nearly every font carries, with text presentation,
+// for surfaces that draw with their own font (Claude Desktop) and terminals
+// without a Nerd Font. No capsule caps: the pill is a plain colored block.
+const UNICODE: IconSet = {
+  capL: '',
+  capR: '',
+  sparkle: '✦',
+  context: '◧',
+  cache: '☰',
+  tokens: '⇅',
+  cost: '$',
+  limits: '◷',
+  reset: '↻',
+  warn: '⚠',
+  activity: '∿',
+  speed: '»',
+  agent: '◈',
+  branch: '⎇',
+  todo: '☑',
+  dot: '●',
+  dotIdle: '○',
+  legend: '■',
+  brain: '✻',
+  pen: '✎',
+  wrench: '⚒',
+}
+
+const PIE_NERD = ['\u{f0a9e}', '\u{f0a9f}', '\u{f0aa0}', '\u{f0aa1}', '\u{f0aa2}', '\u{f0aa3}', '\u{f0aa4}', '\u{f0aa5}']
+const PIE_UNICODE = ['◐', '◓', '◑', '◒']
+
+type Look = { icons: IconSet; pie: readonly string[]; isTerminal: boolean; hasSvg: boolean }
+
+// the surfaces that draw an `Svg`; the terminal's table only stands one in
+const SVG_SURFACES: ReadonlySet<string> = new Set(['desktop', 'vscode', 'mobile'])
+
+/** Which glyphs a surface gets: Nerd Font in the terminal, plain symbols elsewhere, unless forced. */
+const lookFor = (surface: string, choice: IconChoice): Look => {
+  const isTerminal = surface === 'terminal'
+  const isNerd = choice === 'nerd' || (choice === 'auto' && isTerminal)
+  return {
+    icons: isNerd ? NERD : UNICODE,
+    pie: isNerd ? PIE_NERD : PIE_UNICODE,
+    isTerminal,
+    hasSvg: SVG_SURFACES.has(surface),
+  }
+}
+
 const SPARK = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
 const LINE = '━'
 const MARK = '┃'
@@ -134,6 +198,7 @@ const dismissedAtom = atom({ plugin: 'capsule-panel', key: 'isPaneDismissed' } a
 const nowAtom = atom({ plugin: 'capsule-panel', key: 'now' } as const, 0)
 const breakdownAtom = atom({ plugin: 'capsule-panel', key: 'breakdown' } as const, null)
 const samplesAtom = atom({ plugin: 'capsule-panel', key: 'rateSamples' } as const, {})
+const warningsAtom = atom({ plugin: 'capsule-panel', key: 'limitWarnings' } as const, {})
 const activityAtom = atom({ plugin: 'capsule-panel', key: 'activity' } as const, [])
 const streamAtom = atom({ plugin: 'capsule-panel', key: 'stream' } as const, { rates: [] })
 const agentsAtom = atom({ plugin: 'capsule-panel', key: 'agents' } as const, { running: 0, names: [] })
@@ -478,12 +543,34 @@ const refreshBreakdown = async ($: EngineInterface): Promise<void> => {
 
 const openPane = ($: EngineInterface) => $.ui.open({ id: PANE_ID, title: PANE_TITLE, columns: PANE_COLUMNS })
 
+/** Warns once per limit window when the burn forecast says it runs out before the reset. */
+const warnOnBurn = async (
+  $: EngineInterface,
+  limits: readonly { kind: string; percentUsed: number; resetsAt?: string }[],
+  samples: Readonly<Record<string, RateSample[]>>,
+  now: number,
+): Promise<void> => {
+  const warned = await read($, warningsAtom)
+  for (const l of limits) {
+    const burn = burnFor(samples[l.kind], l.percentUsed, l.resetsAt, now)
+    const window = l.resetsAt ?? 'open'
+    if (burn === undefined || !burn.isShort || warned[l.kind] === window) continue
+    const resetIn = l.resetsAt === undefined ? undefined : Date.parse(l.resetsAt) - now
+    const reset = resetIn === undefined || Number.isNaN(resetIn) ? '' : `, before it resets in ${fmtSpan(resetIn)}`
+    $.ui.toast(`⚠ ${shortKind(l.kind)} limit on pace to run out in ~${fmtSpan(burn.etaMs)}${reset}`, {
+      timeoutMs: TOAST_MS,
+    })
+    await update($, warningsAtom, w => ({ ...w, [l.kind]: window }))
+  }
+}
+
 // ── drawing helpers ───────────────────────────────────────────────────────
 
 type Ui = {
   Box: ElementConstructor<BoxProps>
   Text: ElementConstructor<TextProps>
   Button: ElementConstructor<ButtonProps>
+  Svg?: ElementConstructor<SvgProps>
 }
 
 type Cell = { ch: string; color: string }
@@ -506,19 +593,120 @@ const drawCells = (ui: Ui, cells: readonly Cell[]) => (
   </ui.Text>
 )
 
-const pill = (ui: Ui, icon: string, label: string, bg: string) => (
-  <ui.Text>
-    <ui.Text color={bg}>{I.capL}</ui.Text>
-    <ui.Text color={C.base} backgroundColor={bg} bold>
-      {`${icon} ${label}`}
+// The capsule drawn as a picture where the surface's own font cannot draw its
+// round ends: one line high, monospaced like the text around it, its icon a
+// vector shape so every icon sits in the same box whatever fonts the surface has.
+// Desktop sets plugin text at 13px on a 19px line: a 12px label in a 17px
+// capsule reads as the same size without making the row taller.
+const PILL_H = 17
+const PILL_FONT = 12
+const PILL_ADVANCE = PILL_FONT * 0.6
+const PILL_PAD = 7
+const ICON_BOX = 10
+// the label's baseline, set by hand: Desktop's scrub drops dominant-baseline from a
+// framed SVG, so 'central' would hold in an image and not in the spinner's frame
+const PILL_BASELINE = PILL_H / 2 + 0.5 + PILL_FONT * 0.36
+const ICON_GAP = 4
+// the band's capsule keeps one width whatever it says, so nothing after it moves
+const BAND_PILL_CHARS = 8
+
+/** A capsule's icon: the glyph a text surface draws and the shape an SVG draws. */
+type PillIcon = { glyph: string; shape: 'sparkle' | 'brain' | 'pen' | 'wrench' | 'spin' }
+
+// One turn a second. The spinner turns inside its own SVG (SMIL), drawn in a
+// frame Claude Desktop keeps across redraws while its markup stays the same:
+// an image is rebuilt on every redraw, so swapping images never animated.
+const SPIN_SECONDS = 1
+
+const escapeXml = (text: string): string =>
+  text.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[ch] ?? ch)
+
+/** The icon in a 10×10 box, drawn in `ink` over `bg`. */
+const iconShape = (icon: PillIcon, ink: string, bg: string): string => {
+  switch (icon.shape) {
+    case 'sparkle':
+      return `<path d="M5 0.5L6.1 3.9L9.5 5L6.1 6.1L5 9.5L3.9 6.1L0.5 5L3.9 3.9Z" fill="${ink}"/>`
+    case 'brain':
+      return `<path d="M5 1V9M1.5 3L8.5 7M1.5 7L8.5 3" stroke="${ink}" stroke-width="1.7" stroke-linecap="round"/>`
+    case 'pen':
+      return `<path d="M7.2 0.9L9.1 2.8L3.6 8.3L0.9 9.1L1.7 6.4Z" fill="${ink}"/>`
+    case 'wrench':
+      return (
+        `<path d="M1.6 8.4L5.6 4.4" stroke="${ink}" stroke-width="2" stroke-linecap="round"/>` +
+        `<circle cx="6.8" cy="3.2" r="2.7" fill="${ink}"/><circle cx="8.3" cy="1.7" r="1.4" fill="${bg}"/>`
+      )
+    default:
+      return (
+        `<circle cx="5" cy="5" r="3.7" fill="none" stroke="${ink}" stroke-opacity="0.3" stroke-width="2.2"/>` +
+        `<path d="M5 1.3A3.7 3.7 0 0 1 5 8.7" fill="none" stroke="${ink}" stroke-width="2.2" stroke-linecap="round">` +
+        `<animateTransform attributeName="transform" type="rotate" from="0 5 5" to="360 5 5"` +
+        ` dur="${SPIN_SECONDS}s" repeatCount="indefinite"/></path>`
+      )
+  }
+}
+
+/** The capsule's SVG and its width in CSS pixels; the label slot is at least `minChars` wide. */
+const pillSvg = (icon: PillIcon, label: string, bg: string, minChars: number): { source: string; width: number } => {
+  const chars = Array.from(label).length
+  const textW = Math.round(chars * PILL_ADVANCE * 10) / 10
+  const slotW = Math.max(chars, minChars) * PILL_ADVANCE
+  const w = Math.ceil(2 * PILL_PAD + ICON_BOX + ICON_GAP + slotW)
+  const h = PILL_H
+  // icon and label centered together, whatever the label's length
+  const groupW = chars === 0 ? ICON_BOX : ICON_BOX + ICON_GAP + textW
+  const iconX = Math.round(((w - groupW) / 2) * 10) / 10
+  const textX = iconX + ICON_BOX + ICON_GAP
+  const source =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
+    `<rect width="${w}" height="${h}" rx="${h / 2}" fill="${bg}"/>` +
+    `<g transform="translate(${iconX} ${(h - ICON_BOX) / 2})">${iconShape(icon, C.base, bg)}</g>` +
+    (chars === 0
+      ? ''
+      : `<text x="${textX}" y="${Math.round(PILL_BASELINE * 10) / 10}"` +
+        ` font-family="ui-monospace, 'Cascadia Mono', Consolas, Menlo, monospace" font-size="${PILL_FONT}" font-weight="600"` +
+        ` fill="${C.base}" textLength="${textW}" lengthAdjust="spacingAndGlyphs">${escapeXml(label)}</text>`) +
+    `</svg>`
+  return { source, width: w }
+}
+
+/**
+ * A capsule label: Nerd Font half-circle caps in the terminal, an SVG capsule
+ * where the surface draws one (Claude Desktop), a plain colored block in a
+ * terminal without the caps. `minChars` keeps the label slot that wide.
+ */
+const pill = (ui: Ui, look: Look, icon: PillIcon, label: string, bg: string, minChars = 0) => {
+  const Svg = ui.Svg
+  if (look.icons.capL === '' && look.hasSvg && Svg !== undefined) {
+    const { source, width } = pillSvg(icon, label, bg, minChars)
+    // never squeezed by a long line beside it; a spinner in a frame, so it turns
+    return (
+      <ui.Box flexShrink={0}>
+        <Svg source={source} alt={label} width={width} height={PILL_H} isInteractive={icon.shape === 'spin'} />
+      </ui.Box>
+    )
+  }
+  const text = label.padEnd(minChars)
+  if (look.icons.capL === '') {
+    return (
+      <ui.Text color={C.base} backgroundColor={bg} weight="semibold">
+        {` ${icon.glyph} ${text} `}
+      </ui.Text>
+    )
+  }
+  return (
+    <ui.Text>
+      <ui.Text color={bg}>{look.icons.capL}</ui.Text>
+      <ui.Text color={C.base} backgroundColor={bg} weight="semibold">
+        {`${icon.glyph} ${text}`}
+      </ui.Text>
+      <ui.Text color={bg}>{look.icons.capR}</ui.Text>
     </ui.Text>
-    <ui.Text color={bg}>{I.capR}</ui.Text>
-  </ui.Text>
-)
+  )
+}
 
 const sectionHeader = (ui: Ui, icon: string, label: string, accent: string, right?: RenderNode) => (
   <ui.Box flexDirection="row" justifyContent="space-between">
-    <ui.Text color={accent} bold>
+    <ui.Text color={accent} weight="semibold">
       {`${icon} ${label}`}
     </ui.Text>
     {right ?? <ui.Text> </ui.Text>}
@@ -528,7 +716,7 @@ const sectionHeader = (ui: Ui, icon: string, label: string, accent: string, righ
 const metricRow = (ui: Ui, icon: string, label: string, accent: string, body: RenderNode[]) => (
   <ui.Box flexDirection="row">
     <ui.Text color={accent}>{`${icon} `}</ui.Text>
-    <ui.Text color={C.subtext} bold>
+    <ui.Text color={C.subtext} weight="semibold">
       {label.padEnd(7)}
     </ui.Text>
     <ui.Text wrap="truncate-end">{body}</ui.Text>
@@ -600,28 +788,34 @@ const sparkCells = (rates: readonly number[], width: number): Cell[] => {
   })
 }
 
-const statusGlyph = (status: ActivityStatus, n: number): Cell => {
-  if (status === 'running') return { ch: PIE[n % PIE.length] ?? '•', color: C.peach }
+const statusGlyph = (status: ActivityStatus, n: number, pie: readonly string[]): Cell => {
+  if (status === 'running') return { ch: pie[n % pie.length] ?? '•', color: C.peach }
   if (status === 'error') return { ch: '✗', color: C.red }
   return { ch: '✓', color: C.green }
 }
 
-const phaseLook = (phase: Phase): { icon: string; label: string; color: string } => {
+/**
+ * What the band's capsule says for a phase. Waiting on tools, or between
+ * steps, it spins; `spin` is that step's spinner.
+ */
+const phaseLook = (phase: Phase, icons: IconSet, spin: PillIcon): { icon: PillIcon; label: string; color: string } => {
   switch (phase) {
     case 'thinking':
-      return { icon: I.brain, label: 'thinking', color: C.mauve }
+      return { icon: { glyph: icons.brain, shape: 'brain' }, label: 'thinking', color: C.mauve }
     case 'responding':
-      return { icon: I.pen, label: 'writing', color: C.blue }
+      return { icon: { glyph: icons.pen, shape: 'pen' }, label: 'writing', color: C.blue }
     case 'tool-input':
-      return { icon: I.wrench, label: 'calling tool', color: C.peach }
+      return { icon: { glyph: icons.wrench, shape: 'wrench' }, label: 'tool use', color: C.peach }
     default:
-      return { icon: I.sparkle, label: 'working', color: C.teal }
+      return { icon: spin, label: 'working', color: C.teal }
   }
 }
 
 // ── hooks ─────────────────────────────────────────────────────────────────
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const opts = parseOptions(options)
+
   on('session.start', async ($, e, next) => {
     try {
       await $.command.register({ name: 'panel', description: 'Toggle the usage panel', immediate: true })
@@ -698,7 +892,10 @@ export const register: Register = on => {
           : { tokens: prev.context.tokens, percent: prev.context.percent, costUsd: prev.costUsd },
       changedAt: now,
     }))
-    if (e.rateLimits.length > 0) await update($, samplesAtom, s => addSamples(s, e.rateLimits, now))
+    if (e.rateLimits.length > 0) {
+      const samples = await update($, samplesAtom, s => addSamples(s, e.rateLimits, now))
+      await warnOnBurn($, e.rateLimits, samples, now)
+    }
     await update($, workAtom, w => ({ ...w, animUntil: Math.max(w.animUntil, now + TWEEN_MS + 2 * TICK_MS) }))
     ensureTicker($)
 
@@ -870,6 +1067,11 @@ export const register: Register = on => {
     scheduleGit($)
     void refreshAgents($)
 
+    // a Windows terminal has no player and plays nothing; elsewhere a short tone
+    if (opts.isSoundOn && !e.isAborted) {
+      void $.audio.play({ asset: DONE_SOUND }, { gain: 0.6 }).catch(() => undefined)
+    }
+
     return next(e)
   })
 
@@ -886,8 +1088,10 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
-    const ui = $.ui.resolve(e)
+    const ui: Ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
+    const look = lookFor(e.surface, opts.icons)
+    const { icons } = look
     const [snapshot, totals, breakdown, samples, activity, stream, agents, todos, git, work, frame, bandHidden, now] =
       await Promise.all([
         read($, snapshotAtom),
@@ -945,38 +1149,38 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Box flexDirection="row" justifyContent="space-between">
-          {pill(ui, I.sparkle, 'USAGE', C.mauve)}
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          {pill(ui, look, { glyph: icons.sparkle, shape: 'sparkle' }, 'USAGE', C.mauve)}
           <Text>
-            <Text color={liveColor}>{isWorking ? I.dot : I.dotIdle}</Text>
+            <Text color={liveColor}>{isWorking ? icons.dot : icons.dotIdle}</Text>
             <Text color={isWorking ? C.teal : C.overlay0}>{isWorking ? ' live' : ' idle'}</Text>
-            <Text color={C.overlay0}>{`  ${elapsed}`}</Text>
+            <Text color={C.overlay0} tabular>{`  ${elapsed}`}</Text>
           </Text>
         </Box>
         {gap(ui)}
 
         {sectionHeader(
           ui,
-          I.context,
+          icons.context,
           'CONTEXT',
           thresholdColor(pct),
-          <Text>
+          <Text tabular>
             <Text color={C.subtext}>
               {ctx === undefined
                 ? '— / — '
                 : `${tokShown === undefined ? '—' : fmtTokens(tokShown)} / ${fmtTokens(ctx.window)} `}
             </Text>
-            <Text color={thresholdColor(pct)} bold>
+            <Text color={thresholdColor(pct)} weight="semibold">
               {pctText(pctShown)}
             </Text>
           </Text>,
         )}
         {drawCells(ui, contextCells(W, pctShown, breakdown, ctx?.window ?? 0, isWorking ? frame.n : undefined))}
         {legend.length > 0 && (
-          <Text wrap="truncate-end">
+          <Text wrap="truncate-end" size="footnote">
             {legend.map(s => (
               <Text>
-                <Text color={sliceColor(s.label)}>{I.legend}</Text>
+                <Text color={sliceColor(s.label)}>{icons.legend}</Text>
                 <Text color={C.overlay0}>{` ${s.label} ${fmtTokens(s.tokens)}  `}</Text>
               </Text>
             ))}
@@ -984,21 +1188,21 @@ export const register: Register = on => {
         )}
         {gap(ui)}
 
-        {metricRow(ui, I.cache, 'CACHE', C.teal, [
-          <Text color={hitColor} bold>
+        {metricRow(ui, icons.cache, 'CACHE', C.teal, [
+          <Text color={hitColor} weight="semibold" tabular>
             {hit === undefined ? '—' : `${hit}% hit`}
           </Text>,
-          <Text color={C.overlay0}>{`  R ${fmtTokens(totals.cacheRead)}  W ${fmtTokens(totals.cacheWrite)}`}</Text>,
+          <Text color={C.overlay0} tabular>{`  R ${fmtTokens(totals.cacheRead)}  W ${fmtTokens(totals.cacheWrite)}`}</Text>,
         ])}
-        {metricRow(ui, I.tokens, 'TOKENS', C.blue, [
-          <Text color={C.text}>{`↑ ${fmtTokens(totals.input)}  ↓ ${fmtTokens(totals.output)}`}</Text>,
-          <Text color={C.overlay0}>{`  ${totals.turns} turn${totals.turns === 1 ? '' : 's'}`}</Text>,
+        {metricRow(ui, icons.tokens, 'TOKENS', C.blue, [
+          <Text color={C.text} tabular>{`↑ ${fmtTokens(totals.input)}  ↓ ${fmtTokens(totals.output)}`}</Text>,
+          <Text color={C.overlay0} tabular>{`  ${totals.turns} turn${totals.turns === 1 ? '' : 's'}`}</Text>,
         ])}
-        {metricRow(ui, I.cost, 'COST', C.peach, [
-          <Text color={C.peach} bold>
+        {metricRow(ui, icons.cost, 'COST', C.peach, [
+          <Text color={C.peach} weight="semibold" tabular>
             {costShown === undefined ? '—' : `$${costShown.toFixed(2)}`}
           </Text>,
-          <Text color={C.overlay0}>
+          <Text color={C.overlay0} tabular>
             {[
               perHour === undefined ? '' : `  $${perHour.toFixed(2)}/h`,
               limits.length === 0 && tokPerHour !== undefined ? `  ${fmtTokens(tokPerHour)} tok/h` : '',
@@ -1007,7 +1211,7 @@ export const register: Register = on => {
         ])}
 
         {limits.length > 0 && gap(ui)}
-        {limits.length > 0 && sectionHeader(ui, I.limits, 'LIMITS', C.sapphire)}
+        {limits.length > 0 && sectionHeader(ui, icons.limits, 'LIMITS', C.sapphire)}
         {limits.map(l => {
           const burn = burnFor(samples[l.kind], l.percentUsed, l.resetsAt, clock)
           const resetIn = l.resetsAt === undefined ? undefined : Date.parse(l.resetsAt) - clock
@@ -1015,13 +1219,13 @@ export const register: Register = on => {
             <Box flexDirection="row">
               <Text color={C.subtext}>{shortKind(l.kind).padEnd(3)}</Text>
               {drawCells(ui, barCells(limitBarW, l.percentUsed, thresholdColor(l.percentUsed)))}
-              <Text color={thresholdColor(l.percentUsed)} bold>{` ${pctText(l.percentUsed).padStart(4)}`}</Text>
-              <Text color={C.overlay0}>
-                {resetIn === undefined || Number.isNaN(resetIn) ? '' : `  ${I.reset} ${fmtSpan(resetIn)}`}
+              <Text color={thresholdColor(l.percentUsed)} weight="semibold" tabular>{` ${pctText(l.percentUsed).padStart(4)}`}</Text>
+              <Text color={C.overlay0} tabular>
+                {resetIn === undefined || Number.isNaN(resetIn) ? '' : `  ${icons.reset} ${fmtSpan(resetIn)}`}
               </Text>
               {burn !== undefined &&
                 (burn.isShort ? (
-                  <Text color={C.red}>{`  ${I.warn} ~${fmtSpan(burn.etaMs)}`}</Text>
+                  <Text color={C.red} tabular>{`  ${icons.warn} ~${fmtSpan(burn.etaMs)}`}</Text>
                 ) : (
                   <Text color={C.green}>{'  ✓'}</Text>
                 ))}
@@ -1032,21 +1236,21 @@ export const register: Register = on => {
 
         {sectionHeader(
           ui,
-          I.activity,
+          icons.activity,
           'ACTIVITY',
           C.lavender,
           shownRate === undefined ? undefined : (
-            <Text color={isWorking ? C.teal : C.overlay0}>{`${I.speed} ${Math.round(shownRate)} tok/s`}</Text>
+            <Text color={isWorking ? C.teal : C.overlay0} tabular>{`${icons.speed} ${Math.round(shownRate)} tok/s`}</Text>
           ),
         )}
         {stream.rates.length >= 2 && drawCells(ui, sparkCells(stream.rates, W))}
         {recent.map(a => {
-          const glyph = statusGlyph(a.status, frame.n)
+          const glyph = statusGlyph(a.status, frame.n, look.pie)
           const ms = a.status === 'running' ? clock - a.startedAt : (a.durationMs ?? 0)
           return (
             <Box flexDirection="row">
               <Text color={glyph.color}>{`${glyph.ch} `}</Text>
-              <Text color={C.blue} bold={a.status === 'running'}>
+              <Text color={C.blue} weight={a.status === 'running' ? 'semibold' : 'regular'}>
                 {toolName(a.tool).padEnd(8)}
               </Text>
               <Box flexGrow={1} flexShrink={1} minWidth={0}>
@@ -1054,13 +1258,13 @@ export const register: Register = on => {
                   {a.summary}
                 </Text>
               </Box>
-              <Text color={C.overlay0}>{` ${fmtSeconds(ms)}`}</Text>
+              <Text color={C.overlay0} tabular>{` ${fmtSeconds(ms)}`}</Text>
             </Box>
           )
         })}
         {agents.running > 0 && (
           <Text color={C.pink} wrap="truncate-end">
-            {`${I.agent} ${agents.running} agent${agents.running === 1 ? '' : 's'} running`}
+            {`${icons.agent} ${agents.running} agent${agents.running === 1 ? '' : 's'} running`}
             {agents.names.length > 0 && <Text color={C.overlay0}>{` · ${agents.names.join(', ')}`}</Text>}
           </Text>
         )}
@@ -1070,9 +1274,9 @@ export const register: Register = on => {
 
         {(git !== null || todos.length > 0) && gap(ui)}
         {git !== null && (
-          <Text wrap="truncate-end">
-            <Text color={C.green}>{`${I.branch} `}</Text>
-            <Text color={C.green} bold>
+          <Text wrap="truncate-end" size="footnote">
+            <Text color={C.green}>{`${icons.branch} `}</Text>
+            <Text color={C.green} weight="semibold">
               {clean(git.branch, 24)}
             </Text>
             <Text color={C.overlay0}>{git.ahead + git.behind > 0 ? ` ↑${git.ahead} ↓${git.behind}` : ''}</Text>
@@ -1083,13 +1287,13 @@ export const register: Register = on => {
         )}
         {todos.length > 0 && (
           <Box flexDirection="row">
-            <Text color={C.lavender} bold>{`${I.todo} TODO `}</Text>
+            <Text color={C.lavender} weight="semibold">{`${icons.todo} TODO `}</Text>
             {drawCells(ui, barCells(12, (done / todos.length) * 100, C.lavender))}
-            <Text color={C.text}>{` ${done}/${todos.length}`}</Text>
+            <Text color={C.text} tabular>{` ${done}/${todos.length}`}</Text>
           </Box>
         )}
         {current !== undefined && (
-          <Text color={C.subtext} wrap="truncate-end">
+          <Text color={C.subtext} wrap="truncate-end" size="footnote">
             {`  → ${current.activeForm ?? current.subject}`}
           </Text>
         )}
@@ -1110,8 +1314,10 @@ export const register: Register = on => {
     if (!e.props.isWorking || e.props.hasSurvey) return next(e)
     if (await read($, bandHiddenAtom)) return next(e)
 
-    const ui = $.ui.resolve(e)
+    const ui: Ui = $.ui.resolve(e)
     const { Box, Text } = ui
+    const look = lookFor(e.surface, opts.icons)
+    const { icons } = look
     const [activity, frame, work, stream, agents] = await Promise.all([
       read($, activityAtom),
       read($, frameAtom),
@@ -1121,26 +1327,27 @@ export const register: Register = on => {
     ])
 
     const running = [...activity].reverse().find(a => a.status === 'running')
-    const spin = PIE[frame.n % PIE.length] ?? '•'
-    const look = running === undefined ? phaseLook(frame.phase) : { icon: spin, label: toolName(running.tool), color: C.peach }
-    const icon = running === undefined && frame.phase === 'idle' ? spin : look.icon
+    const spin: PillIcon = { glyph: look.pie[frame.n % look.pie.length] ?? '•', shape: 'spin' }
+    const current =
+      running === undefined
+        ? phaseLook(frame.phase, icons, spin)
+        : { icon: spin, label: toolName(running.tool), color: C.peach }
     const detail = running === undefined ? '' : ` ${running.summary}`
     const toolMs = running === undefined ? undefined : frame.at - running.startedAt
     const turnMs = work.startedAt === undefined ? undefined : frame.at - work.startedAt
     const rate = frame.liveRate ?? stream.rates[stream.rates.length - 1]
 
     return (
-      <Box flexDirection="row" justifyContent="space-between" width={e.props.bodyColumns}>
-        <Box flexDirection="row" flexShrink={1} minWidth={0}>
-          {pill(ui, icon, look.label, look.color)}
-          <Text color={C.subtext} wrap="truncate-end">
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" width={e.props.bodyColumns}>
+        <Box flexDirection="row" flexShrink={1} minWidth={0} alignItems="center">
+          {pill(ui, look, current.icon, current.label, current.color, BAND_PILL_CHARS)}
+          <Text color={C.subtext} wrap="truncate-end" tabular>
             {`${detail}${toolMs === undefined ? '' : ` · ${fmtSeconds(toolMs)}`}`}
           </Text>
         </Box>
-        <Text>
-          {rate !== undefined && <Text color={C.teal}>{`  ${I.speed} ${Math.round(rate)} tok/s `}</Text>}
-          {stream.rates.length >= 2 && drawCells(ui, sparkCells(stream.rates, 8))}
-          {agents.running > 0 && <Text color={C.pink}>{`  ${I.agent} ${agents.running}`}</Text>}
+        <Text tabular>
+          {rate !== undefined && <Text color={C.teal}>{`  ${icons.speed} ${Math.round(rate)} tok/s`}</Text>}
+          {agents.running > 0 && <Text color={C.pink}>{`  ${icons.agent} ${agents.running}`}</Text>}
           {turnMs !== undefined && <Text color={C.overlay0}>{`  ${fmtElapsed(turnMs)}`}</Text>}
         </Text>
       </Box>

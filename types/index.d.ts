@@ -61,6 +61,7 @@ export type WorkState = { isWorking: boolean; startedAt?: number; animUntil: num
 
 export type Phase = 'idle' | 'thinking' | 'responding' | 'tool-input' | 'tools'
 
+/** One tick of the work animation. */
 export type Frame = { n: number; at: number; phase: Phase; liveRate?: number }
 
 declare module 'claude-code' {
@@ -73,6 +74,8 @@ declare module 'claude-code' {
       now: number
       breakdown: ContextBreakdown | null
       rateSamples: Record<string, RateSample[]>
+      /** Per rate-limit kind, the reset time of the window already warned about. */
+      limitWarnings: Record<string, string>
       activity: ActivityEntry[]
       stream: StreamStats
       agents: AgentSummary

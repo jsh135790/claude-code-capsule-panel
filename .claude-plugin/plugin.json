@@ -1,11 +1,26 @@
 {
   "name": "capsule-panel",
-  "version": "0.2.0",
-  "description": "Live usage dashboard: context, cache, rate limits, cost and activity in a capsule-style pane.",
+  "version": "0.3.0",
+  "description": "Live usage dashboard: context, cache, rate limits, cost and activity in a capsule-style pane, plus a live band above the prompt while Claude works.",
   "author": { "name": "jsh135790" },
   "homepage": "https://github.com/jsh135790/claude-code-capsule-panel",
   "repository": "https://github.com/jsh135790/claude-code-capsule-panel",
   "license": "MIT",
   "keywords": ["dashboard", "usage", "context", "rate-limit", "catppuccin", "nerd-fonts"],
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "icons": {
+      "type": "string",
+      "title": "Icon set",
+      "description": "Icon set: auto uses Nerd Font glyphs in the terminal and plain Unicode symbols elsewhere (Claude Desktop); nerd or unicode forces one",
+      "default": "auto",
+      "options": ["auto", "nerd", "unicode"]
+    },
+    "sound": {
+      "type": "boolean",
+      "title": "Completion sound",
+      "description": "Play a short tone when a turn completes (silent in a Windows terminal, which has no player)",
+      "default": true
+    }
+  }
 }
