@@ -25,7 +25,7 @@ When a turn completes, a short tone plays where the platform has a player (see O
 
 - Claude Code 2.1.317 or later, in the terminal or in Claude Desktop
 - In the terminal, a [Nerd Font](https://www.nerdfonts.com/) for the icons (developed with MartianMono Nerd Font in Windows Terminal). Without one, set `icons` to `unicode` (see Options) and the pane draws plain symbols instead
-- Claude Desktop needs nothing: it gets the plain symbols automatically
+- Claude Desktop needs nothing: it draws the icons and capsules as vector shapes automatically
 
 ## Install
 
@@ -52,7 +52,7 @@ Set them in `/config` under the plugin's name, or in `~/.claude/settings.json` u
 
 | Option | Values | Default | What it does |
 | --- | --- | --- | --- |
-| `icons` | `auto`, `nerd`, `unicode` | `auto` | `auto` draws Nerd Font glyphs in the terminal and plain Unicode symbols elsewhere; the others force one set |
+| `icons` | `auto`, `nerd`, `unicode` | `auto` | `auto` draws Nerd Font glyphs in the terminal and vector icons in Claude Desktop; `nerd` forces the glyphs everywhere, `unicode` plain symbols in the terminal |
 | `sound` | `true`, `false` | `true` | Plays a short tone when a turn completes. macOS plays it with `afplay`; a Windows or Linux terminal has no player and stays silent; Claude Desktop depends on the app |
 
 ## Optional: matching status line

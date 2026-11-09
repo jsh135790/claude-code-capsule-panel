@@ -139,12 +139,13 @@ const UNICODE: IconSet = {
 const PIE_NERD = ['\u{f0a9e}', '\u{f0a9f}', '\u{f0aa0}', '\u{f0aa1}', '\u{f0aa2}', '\u{f0aa3}', '\u{f0aa4}', '\u{f0aa5}']
 const PIE_UNICODE = ['◐', '◓', '◑', '◒']
 
-type Look = { icons: IconSet; pie: readonly string[]; isTerminal: boolean; hasSvg: boolean }
+/** `isVector`: icons and capsules are drawn as SVG shapes rather than font glyphs. */
+type Look = { icons: IconSet; pie: readonly string[]; isTerminal: boolean; isVector: boolean }
 
 // the surfaces that draw an `Svg`; the terminal's table only stands one in
 const SVG_SURFACES: ReadonlySet<string> = new Set(['desktop', 'vscode', 'mobile'])
 
-/** Which glyphs a surface gets: Nerd Font in the terminal, plain symbols elsewhere, unless forced. */
+/** Which glyphs a surface gets: Nerd Font in the terminal, vector shapes elsewhere, unless forced. */
 const lookFor = (surface: string, choice: IconChoice): Look => {
   const isTerminal = surface === 'terminal'
   const isNerd = choice === 'nerd' || (choice === 'auto' && isTerminal)
@@ -152,7 +153,7 @@ const lookFor = (surface: string, choice: IconChoice): Look => {
     icons: isNerd ? NERD : UNICODE,
     pie: isNerd ? PIE_NERD : PIE_UNICODE,
     isTerminal,
-    hasSvg: SVG_SURFACES.has(surface),
+    isVector: !isNerd && SVG_SURFACES.has(surface),
   }
 }
 
@@ -607,15 +608,15 @@ const ICON_BOX = 10
 // framed SVG, so 'central' would hold in an image and not in the spinner's frame
 const PILL_BASELINE = PILL_H / 2 + 0.5 + PILL_FONT * 0.36
 const ICON_GAP = 4
-// the band's capsule keeps one width whatever it says, so nothing after it moves
-const BAND_PILL_CHARS = 8
 
 /** A capsule's icon: the glyph a text surface draws and the shape an SVG draws. */
 type PillIcon = { glyph: string; shape: 'sparkle' | 'brain' | 'pen' | 'wrench' | 'spin' }
 
 // One turn a second. The spinner turns inside its own SVG (SMIL), drawn in a
-// frame Claude Desktop keeps across redraws while its markup stays the same:
-// an image is rebuilt on every redraw, so swapping images never animated.
+// frame Claude Desktop keeps across redraws only while the frame's markup,
+// alt and size stay byte for byte the same: an image is rebuilt on every
+// redraw, so swapping images never animated, and a frame whose markup carries
+// the label or the colour is rebuilt, and restarts, whenever those change.
 const SPIN_SECONDS = 1
 
 const escapeXml = (text: string): string =>
@@ -645,21 +646,21 @@ const iconShape = (icon: PillIcon, ink: string, bg: string): string => {
   }
 }
 
-/** The capsule's SVG and its width in CSS pixels; the label slot is at least `minChars` wide. */
-const pillSvg = (icon: PillIcon, label: string, bg: string, minChars: number): { source: string; width: number } => {
+/**
+ * The capsule's SVG and its width in CSS pixels, sized to what it says: the
+ * same padding at both ends, the icon always `PILL_PAD` from the left edge.
+ * `isSlotEmpty` leaves the icon out, for the spinner laid over it.
+ */
+const pillSvg = (icon: PillIcon, label: string, bg: string, isSlotEmpty: boolean): { source: string; width: number } => {
   const chars = Array.from(label).length
   const textW = Math.round(chars * PILL_ADVANCE * 10) / 10
-  const slotW = Math.max(chars, minChars) * PILL_ADVANCE
-  const w = Math.ceil(2 * PILL_PAD + ICON_BOX + ICON_GAP + slotW)
+  const w = Math.ceil(2 * PILL_PAD + ICON_BOX + (chars === 0 ? 0 : ICON_GAP + textW))
   const h = PILL_H
-  // icon and label centered together, whatever the label's length
-  const groupW = chars === 0 ? ICON_BOX : ICON_BOX + ICON_GAP + textW
-  const iconX = Math.round(((w - groupW) / 2) * 10) / 10
-  const textX = iconX + ICON_BOX + ICON_GAP
+  const textX = PILL_PAD + ICON_BOX + ICON_GAP
   const source =
     `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
     `<rect width="${w}" height="${h}" rx="${h / 2}" fill="${bg}"/>` +
-    `<g transform="translate(${iconX} ${(h - ICON_BOX) / 2})">${iconShape(icon, C.base, bg)}</g>` +
+    (isSlotEmpty ? '' : `<g transform="translate(${PILL_PAD} ${(h - ICON_BOX) / 2})">${iconShape(icon, C.base, bg)}</g>`) +
     (chars === 0
       ? ''
       : `<text x="${textX}" y="${Math.round(PILL_BASELINE * 10) / 10}"` +
@@ -669,56 +670,151 @@ const pillSvg = (icon: PillIcon, label: string, bg: string, minChars: number): {
   return { source, width: w }
 }
 
+// The spinner: one frame whose markup never changes, laid over the capsule's
+// empty icon slot, so a new label or colour beneath it leaves it turning. Its
+// own background is clear; its colour and font are written on the root so the
+// surface never adds its own (which it would reread, and could change, per redraw).
+const SPINNER_W = PILL_PAD + ICON_BOX + 1
+const SPINNER_ALT = 'working'
+const SPINNER_SVG =
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${SPINNER_W}" height="${PILL_H}" viewBox="0 0 ${SPINNER_W} ${PILL_H}"` +
+  ` color="${C.base}" font-family="monospace">` +
+  `<g transform="translate(${PILL_PAD} ${(PILL_H - ICON_BOX) / 2})">${iconShape({ glyph: '', shape: 'spin' }, C.base, 'none')}</g>` +
+  `</svg>`
+
 /**
  * A capsule label: Nerd Font half-circle caps in the terminal, an SVG capsule
  * where the surface draws one (Claude Desktop), a plain colored block in a
- * terminal without the caps. `minChars` keeps the label slot that wide.
+ * terminal without the caps. Sized to its content, and never squeezed by a
+ * long line beside it.
  */
-const pill = (ui: Ui, look: Look, icon: PillIcon, label: string, bg: string, minChars = 0) => {
+const pill = (ui: Ui, look: Look, icon: PillIcon, label: string, bg: string) => {
   const Svg = ui.Svg
-  if (look.icons.capL === '' && look.hasSvg && Svg !== undefined) {
-    const { source, width } = pillSvg(icon, label, bg, minChars)
-    // never squeezed by a long line beside it; a spinner in a frame, so it turns
+  if (look.isVector && Svg !== undefined) {
+    const isSpinning = icon.shape === 'spin'
+    const { source, width } = pillSvg(icon, label, bg, isSpinning)
     return (
       <ui.Box flexShrink={0}>
-        <Svg source={source} alt={label} width={width} height={PILL_H} isInteractive={icon.shape === 'spin'} />
+        <Svg source={source} alt={label} width={width} height={PILL_H} isInteractive={false} />
+        {isSpinning && (
+          <ui.Box position="absolute" top={0} left={0}>
+            <Svg source={SPINNER_SVG} alt={SPINNER_ALT} width={SPINNER_W} height={PILL_H} isInteractive />
+          </ui.Box>
+        )}
       </ui.Box>
     )
   }
-  const text = label.padEnd(minChars)
   if (look.icons.capL === '') {
     return (
-      <ui.Text color={C.base} backgroundColor={bg} weight="semibold">
-        {` ${icon.glyph} ${text} `}
-      </ui.Text>
+      <ui.Box flexShrink={0}>
+        <ui.Text color={C.base} backgroundColor={bg} weight="semibold">
+          {` ${icon.glyph} ${label} `}
+        </ui.Text>
+      </ui.Box>
     )
   }
   return (
-    <ui.Text>
-      <ui.Text color={bg}>{look.icons.capL}</ui.Text>
-      <ui.Text color={C.base} backgroundColor={bg} weight="semibold">
-        {`${icon.glyph} ${text}`}
+    <ui.Box flexShrink={0}>
+      <ui.Text>
+        <ui.Text color={bg}>{look.icons.capL}</ui.Text>
+        <ui.Text color={C.base} backgroundColor={bg} weight="semibold">
+          {`${icon.glyph} ${label}`}
+        </ui.Text>
+        <ui.Text color={bg}>{look.icons.capR}</ui.Text>
       </ui.Text>
-      <ui.Text color={bg}>{look.icons.capR}</ui.Text>
-    </ui.Text>
+    </ui.Box>
   )
 }
 
-const sectionHeader = (ui: Ui, icon: string, label: string, accent: string, right?: RenderNode) => (
-  <ui.Box flexDirection="row" justifyContent="space-between">
-    <ui.Text color={accent} weight="semibold">
-      {`${icon} ${label}`}
-    </ui.Text>
+// Section icons drawn as shapes where the surface's own font would pick the
+// glyphs (Claude Desktop): one stroke, one box, upright whatever the font.
+// Drawn on a 24-unit grid at 12px, so a 3.2 stroke is 1.6px.
+const ICON_PX = 12
+
+type IconName =
+  | 'context'
+  | 'cache'
+  | 'tokens'
+  | 'cost'
+  | 'limits'
+  | 'reset'
+  | 'warn'
+  | 'activity'
+  | 'speed'
+  | 'agent'
+  | 'branch'
+  | 'todo'
+
+const dot = (cx: number, cy: number, r: number, c: string) =>
+  `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${c}" stroke="none"/>`
+
+const ICON_SHAPES: { readonly [K in IconName]: (c: string) => string } = {
+  context: c =>
+    `<rect x="3" y="3" width="18" height="18" rx="4"/>` +
+    `<path d="M7 3H12V21H7A4 4 0 0 1 3 17V7A4 4 0 0 1 7 3Z" fill="${c}" stroke="none"/>`,
+  cache: () =>
+    `<ellipse cx="12" cy="6" rx="8" ry="3"/>` +
+    `<path d="M4 6V18C4 19.66 7.58 21 12 21S20 19.66 20 18V6M4 12C4 13.66 7.58 15 12 15S20 13.66 20 12"/>`,
+  tokens: () => `<path d="M7 20V4M3 8L7 4L11 8M17 4V20M13 16L17 20L21 16"/>`,
+  cost: () =>
+    `<path d="M12 2V22M17 6.5C16.2 5 14.4 4 12 4C9.2 4 7 5.5 7 7.8C7 12.8 17 10.8 17 16.2C17 18.5 14.8 20 12 20C9.4 20 7.4 18.9 6.7 17.2"/>`,
+  limits: () => `<circle cx="12" cy="12" r="9"/><path d="M12 7V12L15.5 14.2"/>`,
+  reset: () => `<path d="M20.5 12A8.5 8.5 0 1 1 17.8 5.8L20.5 8.5"/><path d="M20.5 3.5V8.5H15.5"/>`,
+  warn: c => `<path d="M12 3.5L21.5 20H2.5Z"/><path d="M12 10V14"/>${dot(12, 17, 1.4, c)}`,
+  activity: () => `<path d="M2 12H6L9 5L15 19L18 12H22"/>`,
+  speed: () => `<path d="M4.2 17.5A9 9 0 1 1 19.8 17.5"/><path d="M12 14L16 9"/>`,
+  agent: c =>
+    `<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V5"/>` +
+    `${dot(12, 3.5, 1.6, c)}${dot(9, 14, 1.5, c)}${dot(15, 14, 1.5, c)}`,
+  branch: () =>
+    `<path d="M6 3V15"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9A9 9 0 0 1 9 18"/>`,
+  todo: () => `<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12.5L11 15.5L16.5 9.5"/>`,
+}
+
+const iconSvg = (name: IconName, color: string): string =>
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${ICON_PX}" height="${ICON_PX}" viewBox="0 0 24 24"` +
+  ` fill="none" stroke="${color}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">` +
+  `${ICON_SHAPES[name](color)}</svg>`
+
+/** A section icon: a vector shape on a surface that draws SVG, else the icon set's glyph. */
+const icon = (ui: Ui, look: Look, name: IconName, color: string): RenderNode => {
+  const Svg = ui.Svg
+  if (look.isVector && Svg !== undefined) {
+    return <Svg source={iconSvg(name, color)} alt={name} width={ICON_PX} height={ICON_PX} isInteractive={false} />
+  }
+  return <ui.Text color={color}>{look.icons[name]}</ui.Text>
+}
+
+/** Spaces that keep their width on every surface (a wrapping line would let trailing ones hang). */
+const space = (ui: Ui, n: number) => <ui.Text wrap="truncate-end">{' '.repeat(n)}</ui.Text>
+
+/** An icon and a figure after it, kept on one line; `lead` spaces before the icon. */
+const iconLabel = (ui: Ui, look: Look, name: IconName, color: string, text: string, lead = 0) => (
+  <ui.Box flexDirection="row" alignItems="center" flexShrink={0}>
+    {lead > 0 && space(ui, lead)}
+    {icon(ui, look, name, color)}
+    <ui.Text color={color} wrap="truncate-end" tabular>{` ${text}`}</ui.Text>
+  </ui.Box>
+)
+
+const sectionHeader = (ui: Ui, look: Look, name: IconName, label: string, accent: string, right?: RenderNode) => (
+  <ui.Box flexDirection="row" justifyContent="space-between" alignItems="center">
+    <ui.Box flexDirection="row" alignItems="center" flexShrink={0}>
+      {icon(ui, look, name, accent)}
+      <ui.Text color={accent} weight="semibold">{` ${label}`}</ui.Text>
+    </ui.Box>
     {right ?? <ui.Text> </ui.Text>}
   </ui.Box>
 )
 
-const metricRow = (ui: Ui, icon: string, label: string, accent: string, body: RenderNode[]) => (
-  <ui.Box flexDirection="row">
-    <ui.Text color={accent}>{`${icon} `}</ui.Text>
-    <ui.Text color={C.subtext} weight="semibold">
-      {label.padEnd(7)}
-    </ui.Text>
+const metricRow = (ui: Ui, look: Look, name: IconName, label: string, accent: string, body: RenderNode[]) => (
+  <ui.Box flexDirection="row" alignItems="center">
+    <ui.Box flexDirection="row" alignItems="center" flexShrink={0}>
+      {icon(ui, look, name, accent)}
+      <ui.Text color={C.subtext} weight="semibold" wrap="truncate-end">
+        {` ${label.padEnd(7)}`}
+      </ui.Text>
+    </ui.Box>
     <ui.Text wrap="truncate-end">{body}</ui.Text>
   </ui.Box>
 )
@@ -1161,7 +1257,8 @@ export const register: Register = (on, options) => {
 
         {sectionHeader(
           ui,
-          icons.context,
+          look,
+          'context',
           'CONTEXT',
           thresholdColor(pct),
           <Text tabular>
@@ -1188,17 +1285,17 @@ export const register: Register = (on, options) => {
         )}
         {gap(ui)}
 
-        {metricRow(ui, icons.cache, 'CACHE', C.teal, [
+        {metricRow(ui, look, 'cache', 'CACHE', C.teal, [
           <Text color={hitColor} weight="semibold" tabular>
             {hit === undefined ? '—' : `${hit}% hit`}
           </Text>,
           <Text color={C.overlay0} tabular>{`  R ${fmtTokens(totals.cacheRead)}  W ${fmtTokens(totals.cacheWrite)}`}</Text>,
         ])}
-        {metricRow(ui, icons.tokens, 'TOKENS', C.blue, [
+        {metricRow(ui, look, 'tokens', 'TOKENS', C.blue, [
           <Text color={C.text} tabular>{`↑ ${fmtTokens(totals.input)}  ↓ ${fmtTokens(totals.output)}`}</Text>,
           <Text color={C.overlay0} tabular>{`  ${totals.turns} turn${totals.turns === 1 ? '' : 's'}`}</Text>,
         ])}
-        {metricRow(ui, icons.cost, 'COST', C.peach, [
+        {metricRow(ui, look, 'cost', 'COST', C.peach, [
           <Text color={C.peach} weight="semibold" tabular>
             {costShown === undefined ? '—' : `$${costShown.toFixed(2)}`}
           </Text>,
@@ -1211,23 +1308,21 @@ export const register: Register = (on, options) => {
         ])}
 
         {limits.length > 0 && gap(ui)}
-        {limits.length > 0 && sectionHeader(ui, icons.limits, 'LIMITS', C.sapphire)}
+        {limits.length > 0 && sectionHeader(ui, look, 'limits', 'LIMITS', C.sapphire)}
         {limits.map(l => {
           const burn = burnFor(samples[l.kind], l.percentUsed, l.resetsAt, clock)
           const resetIn = l.resetsAt === undefined ? undefined : Date.parse(l.resetsAt) - clock
           return (
-            <Box flexDirection="row">
-              <Text color={C.subtext}>{shortKind(l.kind).padEnd(3)}</Text>
+            <Box flexDirection="row" alignItems="center">
+              <Text color={C.subtext} wrap="truncate-end">{shortKind(l.kind).padEnd(3)}</Text>
               {drawCells(ui, barCells(limitBarW, l.percentUsed, thresholdColor(l.percentUsed)))}
-              <Text color={thresholdColor(l.percentUsed)} weight="semibold" tabular>{` ${pctText(l.percentUsed).padStart(4)}`}</Text>
-              <Text color={C.overlay0} tabular>
-                {resetIn === undefined || Number.isNaN(resetIn) ? '' : `  ${icons.reset} ${fmtSpan(resetIn)}`}
-              </Text>
+              <Text color={thresholdColor(l.percentUsed)} weight="semibold" wrap="truncate-end" tabular>{` ${pctText(l.percentUsed).padStart(4)}`}</Text>
+              {resetIn !== undefined && !Number.isNaN(resetIn) && iconLabel(ui, look, 'reset', C.overlay0, fmtSpan(resetIn), 2)}
               {burn !== undefined &&
                 (burn.isShort ? (
-                  <Text color={C.red} tabular>{`  ${icons.warn} ~${fmtSpan(burn.etaMs)}`}</Text>
+                  iconLabel(ui, look, 'warn', C.red, `~${fmtSpan(burn.etaMs)}`, 2)
                 ) : (
-                  <Text color={C.green}>{'  ✓'}</Text>
+                  <Text color={C.green} wrap="truncate-end">{'  ✓'}</Text>
                 ))}
             </Box>
           )
@@ -1236,12 +1331,13 @@ export const register: Register = (on, options) => {
 
         {sectionHeader(
           ui,
-          icons.activity,
+          look,
+          'activity',
           'ACTIVITY',
           C.lavender,
-          shownRate === undefined ? undefined : (
-            <Text color={isWorking ? C.teal : C.overlay0} tabular>{`${icons.speed} ${Math.round(shownRate)} tok/s`}</Text>
-          ),
+          shownRate === undefined
+            ? undefined
+            : iconLabel(ui, look, 'speed', isWorking ? C.teal : C.overlay0, `${Math.round(shownRate)} tok/s`),
         )}
         {stream.rates.length >= 2 && drawCells(ui, sparkCells(stream.rates, W))}
         {recent.map(a => {
@@ -1263,10 +1359,13 @@ export const register: Register = (on, options) => {
           )
         })}
         {agents.running > 0 && (
-          <Text color={C.pink} wrap="truncate-end">
-            {`${icons.agent} ${agents.running} agent${agents.running === 1 ? '' : 's'} running`}
-            {agents.names.length > 0 && <Text color={C.overlay0}>{` · ${agents.names.join(', ')}`}</Text>}
-          </Text>
+          <Box flexDirection="row" alignItems="center">
+            {icon(ui, look, 'agent', C.pink)}
+            <Text color={C.pink} wrap="truncate-end">
+              {` ${agents.running} agent${agents.running === 1 ? '' : 's'} running`}
+              {agents.names.length > 0 && <Text color={C.overlay0}>{` · ${agents.names.join(', ')}`}</Text>}
+            </Text>
+          </Box>
         )}
         {recent.length === 0 && stream.rates.length < 2 && agents.running === 0 && (
           <Text color={C.overlay0}>no activity yet</Text>
@@ -1274,20 +1373,23 @@ export const register: Register = (on, options) => {
 
         {(git !== null || todos.length > 0) && gap(ui)}
         {git !== null && (
-          <Text wrap="truncate-end" size="footnote">
-            <Text color={C.green}>{`${icons.branch} `}</Text>
-            <Text color={C.green} weight="semibold">
-              {clean(git.branch, 24)}
+          <Box flexDirection="row" alignItems="center">
+            {icon(ui, look, 'branch', C.green)}
+            <Text wrap="truncate-end" size="footnote">
+              <Text color={C.green} weight="semibold">
+                {` ${clean(git.branch, 24)}`}
+              </Text>
+              <Text color={C.overlay0}>{git.ahead + git.behind > 0 ? ` ↑${git.ahead} ↓${git.behind}` : ''}</Text>
+              {git.added + git.removed > 0 && <Text color={C.green}>{`  +${git.added}`}</Text>}
+              {git.added + git.removed > 0 && <Text color={C.red}>{` −${git.removed}`}</Text>}
+              <Text color={C.overlay0}>{git.files > 0 ? ` · ${git.files} files` : ' · clean'}</Text>
             </Text>
-            <Text color={C.overlay0}>{git.ahead + git.behind > 0 ? ` ↑${git.ahead} ↓${git.behind}` : ''}</Text>
-            {git.added + git.removed > 0 && <Text color={C.green}>{`  +${git.added}`}</Text>}
-            {git.added + git.removed > 0 && <Text color={C.red}>{` −${git.removed}`}</Text>}
-            <Text color={C.overlay0}>{git.files > 0 ? ` · ${git.files} files` : ' · clean'}</Text>
-          </Text>
+          </Box>
         )}
         {todos.length > 0 && (
-          <Box flexDirection="row">
-            <Text color={C.lavender} weight="semibold">{`${icons.todo} TODO `}</Text>
+          <Box flexDirection="row" alignItems="center">
+            {icon(ui, look, 'todo', C.lavender)}
+            <Text color={C.lavender} weight="semibold" wrap="truncate-end">{' TODO '}</Text>
             {drawCells(ui, barCells(12, (done / todos.length) * 100, C.lavender))}
             <Text color={C.text} tabular>{` ${done}/${todos.length}`}</Text>
           </Box>
@@ -1337,19 +1439,24 @@ export const register: Register = (on, options) => {
     const turnMs = work.startedAt === undefined ? undefined : frame.at - work.startedAt
     const rate = frame.liveRate ?? stream.rates[stream.rates.length - 1]
 
+    // One line whatever the width: the capsule and the figures on the right keep
+    // their size, and only the detail between them gives way, cut with an ellipsis.
+    // A graphical surface counts columns in its own font, so it fills the band.
     return (
-      <Box flexDirection="row" justifyContent="space-between" alignItems="center" width={e.props.bodyColumns}>
-        <Box flexDirection="row" flexShrink={1} minWidth={0} alignItems="center">
-          {pill(ui, look, current.icon, current.label, current.color, BAND_PILL_CHARS)}
+      <Box flexDirection="row" alignItems="center" width={look.isTerminal ? e.props.bodyColumns : '100%'}>
+        {pill(ui, look, current.icon, current.label, current.color)}
+        <Box flexGrow={1} flexShrink={1} minWidth={0}>
           <Text color={C.subtext} wrap="truncate-end" tabular>
             {`${detail}${toolMs === undefined ? '' : ` · ${fmtSeconds(toolMs)}`}`}
           </Text>
         </Box>
-        <Text tabular>
-          {rate !== undefined && <Text color={C.teal}>{`  ${icons.speed} ${Math.round(rate)} tok/s`}</Text>}
-          {agents.running > 0 && <Text color={C.pink}>{`  ${icons.agent} ${agents.running}`}</Text>}
-          {turnMs !== undefined && <Text color={C.overlay0}>{`  ${fmtElapsed(turnMs)}`}</Text>}
-        </Text>
+        <Box flexDirection="row" alignItems="center" flexShrink={0}>
+          {rate !== undefined && iconLabel(ui, look, 'speed', C.teal, `${Math.round(rate)} tok/s`, 2)}
+          {agents.running > 0 && iconLabel(ui, look, 'agent', C.pink, `${agents.running}`, 2)}
+          {turnMs !== undefined && (
+            <Text color={C.overlay0} wrap="truncate-end" tabular>{`  ${fmtElapsed(turnMs)}`}</Text>
+          )}
+        </Box>
       </Box>
     )
   })

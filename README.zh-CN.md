@@ -25,7 +25,7 @@ Claude 工作时，输入框上方还会多出一行横幅：标明当前阶段�
 
 - Claude Code 2.1.317 或更新版本，终端和 Claude Desktop 都能用
 - 终端里建议使用 [Nerd Font](https://www.nerdfonts.com/) 字体显示图标（开发环境为 Windows Terminal + MartianMono Nerd Font）。没有的话把 `icons` 设成 `unicode`（见「选项」），面板会改用普通 Unicode 符号
-- Claude Desktop 不需要任何设置，会自动使用普通符号
+- Claude Desktop 不需要任何设置，图标和胶囊会自动画成矢量图形
 
 ## 安装
 
@@ -52,7 +52,7 @@ Claude 工作时，输入框上方还会多出一行横幅：标明当前阶段�
 
 | 选项 | 取值 | 默认 | 作用 |
 | --- | --- | --- | --- |
-| `icons` | `auto`、`nerd`、`unicode` | `auto` | `auto` 在终端用 Nerd Font 图标、其他地方用普通 Unicode 符号；另外两个值强制指定 |
+| `icons` | `auto`、`nerd`、`unicode` | `auto` | `auto` 在终端用 Nerd Font 图标、在 Claude Desktop 用矢量图标；`nerd` 处处强制用 Nerd Font，`unicode` 让终端改用普通符号 |
 | `sound` | `true`、`false` | `true` | 每轮结束响一声短提示音。macOS 用 `afplay` 播放；Windows 和 Linux 终端没有播放器，不会出声；Claude Desktop 取决于应用本身 |
 
 ## 可选：同风格 statusline

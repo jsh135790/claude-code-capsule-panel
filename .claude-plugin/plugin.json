@@ -1,6 +1,6 @@
 {
   "name": "capsule-panel",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Live usage dashboard: context, cache, rate limits, cost and activity in a capsule-style pane, plus a live band above the prompt while Claude works.",
   "author": { "name": "jsh135790" },
   "homepage": "https://github.com/jsh135790/claude-code-capsule-panel",
@@ -12,7 +12,7 @@
     "icons": {
       "type": "string",
       "title": "Icon set",
-      "description": "Icon set: auto uses Nerd Font glyphs in the terminal and plain Unicode symbols elsewhere (Claude Desktop); nerd or unicode forces one",
+      "description": "Icon set: auto uses Nerd Font glyphs in the terminal and vector icons in Claude Desktop; nerd or unicode forces one",
       "default": "auto",
       "options": ["auto", "nerd", "unicode"]
     },

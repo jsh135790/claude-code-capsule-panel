@@ -38,7 +38,7 @@ const BLOCKS = /[▀-▟]/
 
 // Hooks beneath the plugin that stand for the engine, so every event the
 // plugin passes on with next(e) settles in the test host.
-const engine = (on: On, panes: UiPane[] = []) => {
+const engine = (on: On, panes: UiPane[] = [], opts: { git?: string } = {}) => {
   const closed: string[] = []
   const toasts: string[] = []
   const played: string[] = []
@@ -54,9 +54,16 @@ const engine = (on: On, panes: UiPane[] = []) => {
   on('session.model', () => ({ value: 'claude-test-1' }))
   on('session.cwd', () => ({ value: 'C:/work' }))
   on('agent.list', () => ({ value: [] }))
-  on('process.run', () => ({
-    value: { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false },
-  }))
+  on('process.run', ($, e) => {
+    const isStatus = e.argv.includes('status')
+    const out = opts.git === undefined ? undefined : isStatus ? opts.git : ''
+    return {
+      value:
+        out === undefined
+          ? { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false }
+          : { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }
+  })
   on('ui.open', () => ({ value: { isPlaced: false, reason: 'test' } }))
   on('ui.panes', () => ({ value: panes }))
   on('ui.close', ($, e) => {
@@ -111,7 +118,7 @@ test('the pane draws its sections on every surface it is placed on', async ($, o
   }
 })
 
-test('the terminal gets Nerd Font glyphs and the desktop plain symbols', async ($, on) => {
+test('the terminal gets Nerd Font glyphs and the desktop vector icons', async ($, on) => {
   engine(on)
   mock.clock(on, { now: 1_000_000 })
   const terminal = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -120,8 +127,28 @@ test('the terminal gets Nerd Font glyphs and the desktop plain symbols', async (
 
   const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await desktop.findAll({ type: 'Text' })).some(t => PUA.test(t.text))).toBe(false)
-  expect(await desktop.find({ type: 'Text', text: /◧ CONTEXT/ })).toBeDefined()
+  expect((await desktop.findAll({ type: 'Text' })).some(t => /[◧☰⇅◷∿»◈⎇☑]/.test(t.text))).toBe(false)
+  expect(await desktop.find({ type: 'Text', text: /^ CONTEXT$/ })).toBeDefined()
+  const icons = (await desktop.findAll({ type: 'Svg' })).filter(s => s.props.width === 12)
+  expect(icons.map(s => s.props.alt)).toEqual(['context', 'cache', 'tokens', 'cost', 'activity'])
+  expect(String(icons[0]?.props.source)).toMatch(/viewBox="0 0 24 24" fill="none" stroke="#6c7086" stroke-width="3\.2"/)
   await desktop.unmount()
+})
+
+test('the desktop branch icon stands upright, as a shape', async ($, on) => {
+  engine(on, [], {
+    git: '# branch.oid abc\n# branch.head main\n# branch.ab +1 -0\n1 .M N... 100644 100644 100644 a b src/x.ts\n',
+  })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const branch = (await ui.findAll({ type: 'Svg' })).find(s => s.props.alt === 'branch')
+  // a vertical trunk, not the sideways ⎇ every font draws
+  expect(String(branch?.props.source)).toMatch(/<path d="M6 3V15"\/>/)
+  expect(await ui.find({ type: 'Text', text: /^ main$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /⎇/ })).toBeUndefined()
+  await ui.unmount()
 })
 
 test('the desktop draws each capsule as an SVG with round ends', async ($, on) => {
@@ -147,8 +174,9 @@ test('icons: unicode drops the Nerd Font glyphs in the terminal too', { options:
   mock.clock(on, { now: 1_000_000 })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.findAll({ type: 'Text' })).some(t => PUA.test(t.text))).toBe(false)
-  expect(await ui.find({ type: 'Text', text: /◧ CONTEXT/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^☰ $/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^◧$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ CONTEXT$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^☰$/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -339,7 +367,7 @@ test('the band leads with the phase pill and draws no pixel art', async ($, on) 
   }
 })
 
-test('a running tool spins the band capsule, which keeps its width', async ($, on) => {
+test('the band capsule fits its label, and its spinner frame never changes', async ($, on) => {
   engine(on)
   const clock = mock.clock(on, { now: 1_000_000 })
   on('tool.call', async () => {
@@ -352,32 +380,75 @@ test('a running tool spins the band capsule, which keeps its width', async ($, o
   const desktop = await $.ui.mount({ ...WORKING_BAND, surface: 'desktop' })
   const terminalCapsule = async () =>
     (await terminal.findAll({ type: 'Text' })).find(t => t.props.backgroundColor !== undefined)?.text ?? ''
+  const capsule = async () => (await desktop.findAll({ type: 'Svg' })).find(s => s.props.isInteractive !== true)
+  const spinner = async () => (await desktop.findAll({ type: 'Svg' })).find(s => s.props.isInteractive === true)
 
-  const thinkingText = await terminalCapsule()
-  const thinkingWidth = (await desktop.find({ type: 'Svg' }))?.props.width
+  const thinkingWidth = Number((await capsule())?.props.width)
+  expect(await spinner()).toBeUndefined()
 
   void $.tool.call({ tool: 'Bash', command: 'npm run build' })
   await clock.advance(120)
   await terminal.redraw()
   await desktop.redraw()
   const first = await terminalCapsule()
-  const firstSvg = String((await desktop.find({ type: 'Svg' }))?.props.source)
-  expect(first).toMatch(/Bash/)
-  expect(Array.from(first).length).toBe(Array.from(thinkingText).length)
-  expect((await desktop.find({ type: 'Svg' }))?.props.width).toBe(thinkingWidth)
+  // nothing pads the label, so it sits centered between the caps
+  expect(first).toMatch(/ Bash$/)
+  const bash = await capsule()
+  expect(bash?.props.alt).toBe('Bash')
+  expect(Number(bash?.props.width)).toBeLessThan(thinkingWidth)
+  // the capsule leaves its icon slot empty: the spinner is a frame laid over it
+  expect(String(bash?.props.source)).not.toMatch(/animateTransform/)
+  const frame = await spinner()
+  expect(frame?.props.alt).toBe('working')
+  expect(String(frame?.props.source)).toMatch(/<animateTransform attributeName="transform" type="rotate"/)
+  expect(String(frame?.props.source)).toMatch(/ color="#1e1e2e" font-family="monospace"/)
 
   await clock.advance(120)
   await terminal.redraw()
   await desktop.redraw()
-  // the terminal steps its glyph; the desktop's spinner turns by itself, in a frame
-  // that survives redraws only while its markup stays the same
+  // the terminal steps its glyph; the desktop's frame turns by itself
   expect(await terminalCapsule()).not.toBe(first)
-  const spinner = await desktop.find({ type: 'Svg' })
-  expect(String(spinner?.props.source)).toBe(firstSvg)
-  expect(spinner?.props.isInteractive).toBe(true)
-  expect(firstSvg).toMatch(/<animateTransform attributeName="transform" type="rotate"/)
+
+  // a new tool changes the capsule's label and width beneath the frame, never
+  // the frame: Claude Desktop keeps a frame only while it stays byte for byte the same
+  void $.tool.call({ tool: 'Glob', pattern: '**/*.ts' })
+  await clock.advance(120)
+  await desktop.redraw()
+  expect((await capsule())?.props.alt).toBe('Glob')
+  const again = await spinner()
+  expect(again?.props.source).toBe(frame?.props.source)
+  expect(again?.props.width).toBe(frame?.props.width)
+  expect(again?.props.height).toBe(frame?.props.height)
+  expect(again?.props.alt).toBe(frame?.props.alt)
   await terminal.unmount()
   await desktop.unmount()
+})
+
+test('the band keeps to one line: only the detail gives way', async ($, on) => {
+  engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', async () => {
+    await clock.sleep(5_000)
+    return { result: {}, text: 'ok' }
+  })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  void $.tool.call({ tool: 'Bash', command: `npm run build -- ${'--flag '.repeat(20)}` })
+  await clock.advance(240)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...WORKING_BAND, props: { ...BAND_PROPS, isWorking: true, bodyColumns: 60 }, surface })
+    const [root] = await ui.findAll({ type: 'Box' })
+    expect(root?.props.width).toBe(surface === 'terminal' ? 60 : '100%')
+    const parts = (root?.children ?? []).filter(
+      (c): c is { type: string; props: Record<string, unknown> } => typeof c === 'object' && c !== null && 'props' in c,
+    )
+    // capsule, detail, figures: only the detail may shrink
+    expect(parts.length).toBe(3)
+    expect(parts.map(p => p.props.flexShrink)).toEqual([0, 1, 0])
+    expect(parts[1]?.props.minWidth).toBe(0)
+    expect((await ui.find({ type: 'Text', text: /npm run build/ }))?.props.wrap).toBe('truncate-end')
+    for (const t of await ui.findAll({ type: 'Text', text: /\d+s$/ })) expect(t.props.wrap).toBe('truncate-end')
+    await ui.unmount()
+  }
 })
 
 test('the pane button hides the band', async ($, on) => {
