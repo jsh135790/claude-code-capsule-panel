@@ -12,7 +12,7 @@ A side pane, one page, with each section hiding itself while it has nothing to s
 
 - **Header**: the model and effort in use, and whether Claude is working
 - **CONTEXT**: how full the context window is, split by category, with a marker where auto-compact kicks in. Below it, how many turns are left before auto-compact at the recent rate of growth, and a **compact now** button while Claude is idle (press it twice within 3 seconds; after a compaction the line shows how far it shrank the context)
-- **CACHE / TOKENS / COST**: prompt-cache hit rate and how long the cache stays warm (seconds in its last minute, then `cold`), tokens in and out, session cost and $/hour
+- **CACHE / TOKENS / COST**: prompt-cache hit rate and how long the cache stays warm (seconds in its last minute, then `cold`), tokens in and out (updated after every request, subagents included, and restored when a session is resumed), session cost and $/hour
 - **SPEND**: what every Claude Code session on this machine has spent today and this week (from Monday), with a bar for each of the last seven days. It adds up the session cost Claude Code reports, an estimate at API prices, kept in the plugin's own store from 0.4.0 on
 - **LIMITS**: each plan rate-limit window with its reset countdown, and a forecast of whether you'll hit it before it resets. Rate limits are only reported on a Claude subscription; without them this section hides and COST shows tokens per hour instead. When the forecast says a window will run out before its reset, a toast says so once per window
 - **ACTIVITY**: a tok/s sparkline, the last five tool calls with their time and outcome, and running subagents

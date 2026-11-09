@@ -1,5 +1,6 @@
-import type { On, RenderPropsOf, RenderSurface, UiPane } from 'claude-code'
+import type { On, RenderPropsOf, RenderSurface, TurnUsage, UiPane } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 
 const PANE_PROPS: RenderPropsOf['Pane'] = {
   title: 'Usage',
@@ -50,6 +51,8 @@ type EngineOptions = {
   surfaces?: RenderSurface[]
   /** The auto-compact threshold the context breakdown reports. */
   threshold?: number
+  /** What `$.session.id()` answers; `s1` when not given. */
+  sessionId?: string
 }
 
 // Hooks beneath the plugin that stand for the engine, so every event the
@@ -63,10 +66,19 @@ const engine = (on: On, panes: UiPane[] = [], opts: EngineOptions = {}) => {
   const compacts: string[] = []
   const store: Record<string, unknown> = { ...opts.store }
   const env = opts.env ?? {}
+  // what each next turn.step's response reports as its usage, in order
+  const steps: TurnUsage[] = []
+  const session = { id: opts.sessionId ?? 's1' }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('turn.step', async function* ($, e) {
+    const usage = steps.shift() ?? null
+    yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage }
+  })
+  on('session.id', () => ({ value: session.id }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.compact', ($, e) => {
     // the kit raises a plugin's compaction with the call's own arguments: no trigger, no messages
@@ -135,7 +147,7 @@ const engine = (on: On, panes: UiPane[] = [], opts: EngineOptions = {}) => {
     return { value: undefined }
   })
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Box' }))
-  return { closed, toasts, played, runs, notes, compacts, store }
+  return { closed, toasts, played, runs, notes, compacts, store, steps, session }
 }
 
 /** Local noon (or the given hour and minute) on a day of November 2026. */
@@ -147,6 +159,30 @@ const measure = (percent: number, extra: { costUsd?: number; limits?: { pct: num
   cost: extra.costUsd === undefined ? undefined : { usd: extra.costUsd },
   changed: ['context' as const],
 })
+
+const usage = (input: number, output: number, read = 0, write = 0): TurnUsage => ({
+  input_tokens: input,
+  output_tokens: output,
+  cache_read_input_tokens: read,
+  cache_creation_input_tokens: write,
+  model: 'claude-test-1',
+})
+
+/** One request of turn `turnId` that reports `u` as it ends, read to its end. */
+const step = async ($: Engine, steps: TurnUsage[], u: TurnUsage, turnId = 't1', agentId?: string) => {
+  steps.push(u)
+  const stream = $.turn.step({
+    turnId,
+    index: 0,
+    model: 'claude-test-1',
+    messageCount: 1,
+    ...(agentId === undefined ? {} : { agentId }),
+  })
+  for await (const _ of stream) {
+    // drained
+  }
+  await stream.result
+}
 
 const complete = (turnId: string) => ({
   answer: '',
@@ -255,28 +291,127 @@ test('the context figure follows the thresholds once the count-up settles', asyn
   await ui.unmount()
 })
 
-test('a completed turn adds up tokens and the cache hit rate', async ($, on) => {
-  engine(on)
+test('each request adds up tokens and the cache hit rate while the turn runs', async ($, on) => {
+  const { steps } = engine(on)
   mock.clock(on, { now: 1_000_000 })
-  await $.turn.complete({
-    answer: '',
-    durationMs: 1000,
-    isAborted: false,
-    turnId: 't1',
-    reason: 'answer',
-    usage: {
-      input_tokens: 1000,
-      output_tokens: 500,
-      cache_read_input_tokens: 91_000,
-      cache_creation_input_tokens: 8_000,
-      model: 'claude-test-1',
-    },
-  })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await step($, steps, usage(1000, 500, 91_000, 8_000))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // no turn.complete yet: a long turn's figures move as it runs
   expect(await ui.find({ type: 'Text', text: /^91% hit$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /↑ 1k {2}↓ 500/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /1 turn$/ })).toBeDefined()
+
+  await step($, steps, usage(1000, 500, 91_000, 8_000))
+  // the turn's end reports the same requests again: they are not counted twice
+  await $.turn.complete({ ...complete('t1'), usage: usage(2000, 1000, 182_000, 16_000) })
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /↑ 2k {2}↓ 1k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /R 182k {2}W 16k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /1 turn$/ })).toBeDefined()
   await ui.unmount()
+})
+
+test("a subagent's requests count toward the tokens but not the turns or the live state", async ($, on) => {
+  const { steps } = engine(on)
+  mock.clock(on, { now: 1_000_000 })
+  await $.turn.start({ text: 'look around', turnId: 'a-t1', agentId: 'a1' })
+  await step($, steps, usage(300, 200), 'a-t1', 'a1')
+  await $.turn.complete({ ...complete('a-t1'), agentId: 'a1' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /↑ 300 {2}↓ 200/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /0 turns$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ idle$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the totals are saved under the session id as the turn ends', async ($, on) => {
+  const { steps, store } = engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await step($, steps, usage(4000, 1500, 50_000, 2_000))
+  await $.turn.complete(complete('t1'))
+  await clock.settle()
+  expect(store['totals/s1']).toMatchObject({ input: 4000, output: 1500, cacheRead: 50_000, cacheWrite: 2_000, turns: 1 })
+})
+
+test('a resumed session starts from what its last run saved, and old entries go', async ($, on) => {
+  const now = 40 * 24 * 60 * MINUTE
+  const { store } = engine(on, [], {
+    store: {
+      'totals/s1': { input: 4000, output: 1500, cacheRead: 50_000, cacheWrite: 2_000, turns: 3, savedAt: now - MINUTE },
+      'totals/old': { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, turns: 1, savedAt: 1 },
+    },
+  })
+  const clock = mock.clock(on, { now })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /↑ 4k {2}↓ 1\.5k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /3 turns$/ })).toBeDefined()
+  await ui.unmount()
+  expect(store['totals/old']).toBeUndefined()
+  expect(store['totals/s1']).toBeDefined()
+})
+
+test('a reload keeps the counts it has instead of the saved ones', async ($, on) => {
+  const { steps } = engine(on, [], {
+    store: { 'totals/s1': { input: 9000, output: 9000, cacheRead: 0, cacheWrite: 0, turns: 9, savedAt: 900_000 } },
+  })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await step($, steps, usage(100, 100))
+  // a reload runs session.start again over the same state
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /↑ 9\.1k {2}↓ 9\.1k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /10 turns$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('/clear saves the ending session and starts the new one from zero', async ($, on) => {
+  const eng = engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await step($, eng.steps, usage(700, 300))
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: {} as never })
+  eng.session.id = 's2'
+  expect(eng.store['totals/s1']).toMatchObject({ input: 700, output: 300, turns: 1 })
+
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await step($, eng.steps, usage(50, 20), 't2')
+  await $.turn.complete(complete('t2'))
+  await clock.settle()
+  expect(eng.store['totals/s2']).toMatchObject({ input: 50, output: 20, turns: 1 })
+  expect(eng.store['totals/s1']).toMatchObject({ input: 700, output: 300, turns: 1 })
+})
+
+test('a /resume inside the process loads the other session and drops this one', async ($, on) => {
+  const eng = engine(on, [], {
+    store: { 'totals/s9': { input: 5000, output: 2500, cacheRead: 0, cacheWrite: 0, turns: 4, savedAt: 900_000 } },
+  })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await step($, eng.steps, usage(700, 300))
+  await $.turn.complete(complete('t1'))
+  await $.session.end({ reason: 'resume', sessionId: 's1', resume: {} as never })
+  eng.session.id = 's9'
+  await clock.advance(1_000)
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /↑ 5k {2}↓ 2\.5k/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /4 turns$/ })).toBeDefined()
+  await ui.unmount()
+  expect(eng.store['totals/s1']).toMatchObject({ input: 700, output: 300, turns: 1 })
 })
 
 test('without rate limits the cost row shows the hourly burn instead', async ($, on) => {

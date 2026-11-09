@@ -9,6 +9,7 @@ import type {
   SvgProps,
   TextProps,
   Timer,
+  TurnUsage,
 } from 'claude-code'
 
 import type {
@@ -56,6 +57,10 @@ const CACHE_LAST_MINUTE_MS = 60_000
 const SPEND_PREFIX = 'spend/'
 const SPEND_KEEP_DAYS = 14
 const SPEND_REFRESH_MS = 5 * 60_000
+const TOTALS_PREFIX = 'totals/'
+const TOTALS_SAVE_MS = 5_000
+const TOTALS_KEEP_DAYS = 30
+const DAY_MS = 24 * 60 * 60_000
 const CTX_HISTORY = 6
 const COMPACT_ARM_MS = 3_000
 const COMPACT_SHOWN_MS = 15 * 60_000
@@ -887,6 +892,132 @@ const recordSpend = async ($: EngineInterface, usd: number, now: number): Promis
   if (was.day !== '' && was.day !== day) await refreshSpend($, false)
 }
 
+// ── session totals: added per request, saved per session id ───────────────
+
+const count = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0)
+
+const isEmptyTotals = (t: SessionTotals): boolean =>
+  t.turns === 0 && t.input === 0 && t.output === 0 && t.cacheRead === 0 && t.cacheWrite === 0
+
+/** A stored value read back field by field: anything that is not a count is 0. */
+const normalizeTotals = (raw: unknown): SessionTotals | undefined => {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const r = raw as Record<string, unknown>
+  return {
+    input: count(r.input),
+    output: count(r.output),
+    cacheRead: count(r.cacheRead),
+    cacheWrite: count(r.cacheWrite),
+    turns: count(r.turns),
+    lastInput: count(r.lastInput),
+    lastRead: count(r.lastRead),
+    lastWrite: count(r.lastWrite),
+    ...(typeof r.model === 'string' ? { model: r.model } : {}),
+  }
+}
+
+/** `b` counted on top of `a`; the latest request's figures are `b`'s once it has any. */
+const addTotals = (a: SessionTotals, b: SessionTotals): SessionTotals => {
+  const latest = isEmptyTotals(b) ? a : b
+  const model = b.model ?? a.model
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheWrite: a.cacheWrite + b.cacheWrite,
+    turns: a.turns + b.turns,
+    lastInput: latest.lastInput,
+    lastRead: latest.lastRead,
+    lastWrite: latest.lastWrite,
+    ...(model !== undefined ? { model } : {}),
+  }
+}
+
+let totalsTimer: Timer | undefined
+
+/** Writes the totals under the session they belong to, so a resume picks them up. */
+const flushTotals = async ($: EngineInterface): Promise<void> => {
+  totalsTimer?.cancel()
+  totalsTimer = undefined
+  try {
+    const { sessionId, ...counts } = await read($, totalsAtom)
+    if (sessionId === undefined || isEmptyTotals(counts)) return
+    await $.store.set(`${TOTALS_PREFIX}${sessionId}`, { ...counts, savedAt: await $.clock.now() })
+  } catch {
+    // counted for this run of the session only
+  }
+}
+
+/** One write per TOTALS_SAVE_MS at most while requests keep coming. */
+const saveTotalsSoon = ($: EngineInterface): void => {
+  if (totalsTimer !== undefined) return
+  try {
+    totalsTimer = $.clock.after(TOTALS_SAVE_MS, () => {
+      totalsTimer = undefined
+      void flushTotals($)
+    })
+  } catch {
+    // the turn's end writes them
+  }
+}
+
+/**
+ * Points the totals at the session the process now runs: a fresh or resumed
+ * one loads what its last run saved, one reached by /resume drops the
+ * previous session's (saved as it ended), and a reload keeps its own.
+ */
+const syncTotalsOwner = async ($: EngineInterface): Promise<void> => {
+  try {
+    const id = await $.session.id()
+    const cur = await read($, totalsAtom)
+    if (cur.sessionId === id) return
+    if (cur.sessionId === undefined && !isEmptyTotals(cur)) {
+      // counted in this process by a version that did not name the session
+      await update($, totalsAtom, t => ({ ...t, sessionId: id }))
+      return
+    }
+    const saved = normalizeTotals(await $.store.get(`${TOTALS_PREFIX}${id}`).catch(() => undefined)) ?? EMPTY_TOTALS
+    await update($, totalsAtom, t => {
+      if (t.sessionId === id) return t
+      // requests that arrived while the store was read count on top; another session's do not
+      return { ...addTotals(saved, t.sessionId === undefined ? t : EMPTY_TOTALS), sessionId: id }
+    })
+  } catch {
+    // a host with no session id: counted for this run only
+  }
+}
+
+/** Drops the saved totals of sessions untouched for TOTALS_KEEP_DAYS. */
+const pruneTotals = async ($: EngineInterface): Promise<void> => {
+  try {
+    const oldest = (await $.clock.now()) - TOTALS_KEEP_DAYS * DAY_MS
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(TOTALS_PREFIX)) continue
+      const v = await $.store.get(key)
+      const savedAt = typeof v === 'object' && v !== null ? (v as { savedAt?: unknown }).savedAt : undefined
+      if (typeof savedAt !== 'number' || savedAt < oldest) await $.store.delete(key)
+    }
+  } catch {
+    // tried again next session
+  }
+}
+
+/** One response's usage, the main thread's or a subagent's, added as it ends. */
+const addUsage = async ($: EngineInterface, usage: TurnUsage, isMain: boolean): Promise<void> => {
+  const input = count(usage.input_tokens)
+  const cacheRead = count(usage.cache_read_input_tokens)
+  const cacheWrite = count(usage.cache_creation_input_tokens)
+  await update($, totalsAtom, prev => ({
+    ...prev,
+    input: prev.input + input,
+    output: prev.output + count(usage.output_tokens),
+    cacheRead: prev.cacheRead + cacheRead,
+    cacheWrite: prev.cacheWrite + cacheWrite,
+    ...(isMain ? { lastInput: input, lastRead: cacheRead, lastWrite: cacheWrite, model: usage.model } : {}),
+  }))
+  saveTotalsSoon($)
+}
+
 /** Today, this week and the last 7 days, this session included. */
 const spendShown = (s: SpendState, now: number): SpendTotals => {
   const mine = s.day === localDay(now) ? Math.max(0, s.lastUsd - s.base) : 0
@@ -1451,6 +1582,7 @@ export const register: Register = on => {
     }
 
     void (async () => {
+      await syncTotalsOwner($)
       await loadSettings($)
       try {
         const usage = await $.session.usage()
@@ -1494,6 +1626,7 @@ export const register: Register = on => {
       await refreshAgents($)
       await refreshGit($)
       await refreshBreakdown($)
+      await pruneTotals($)
     })()
 
     void (async () => {
@@ -1569,16 +1702,28 @@ export const register: Register = on => {
   })
 
   on('turn.start', async ($, e, next) => {
+    // a subagent's run belongs to the main turn that spawned it, and may outlast it
+    if (e.agentId !== undefined) return next(e)
     const now = await $.clock.now()
     live = { chars: 0, firstAt: 0, phase: 'thinking' }
     await update($, workAtom, w => ({ ...w, isWorking: true, startedAt: now }))
     ensureTicker($)
+    // a /resume or /clear since the last turn moved the process to another session
+    await syncTotalsOwner($)
+    await update($, totalsAtom, t => ({ ...t, turns: t.turns + 1 }))
     return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
     const stream = next(e)
-    if (e.agentId !== undefined) return yield* stream
+    if (e.agentId !== undefined) {
+      // a subagent's requests count toward the session's tokens, as they do toward its cost
+      for await (const chunk of stream) {
+        if (chunk.kind === 'stop' && chunk.usage != null) await addUsage($, chunk.usage, false)
+        yield chunk
+      }
+      return await stream.result
+    }
 
     const effort = effortText(e.effort)
     const info = await read($, modelInfoAtom)
@@ -1599,6 +1744,8 @@ export const register: Register = on => {
       } else if (chunk.kind === 'tool') {
         live.phase = 'tool-input'
       } else if (chunk.kind === 'stop') {
+        // counted as each response ends, so a long turn's figures move while it runs
+        if (chunk.usage != null) await addUsage($, chunk.usage, true)
         // the request wrote or read the prompt cache: its TTL runs from here
         const stoppedAt = await $.clock.now()
         await update($, cacheAtom, c => ({ ...c, warmAt: stoppedAt }))
@@ -1715,20 +1862,8 @@ export const register: Register = on => {
       return next(e)
     }
 
-    const usage = e.usage
-    if (usage !== undefined) {
-      await update($, totalsAtom, prev => ({
-        input: prev.input + usage.input_tokens,
-        output: prev.output + usage.output_tokens,
-        cacheRead: prev.cacheRead + usage.cache_read_input_tokens,
-        cacheWrite: prev.cacheWrite + usage.cache_creation_input_tokens,
-        turns: prev.turns + 1,
-        lastInput: usage.input_tokens,
-        lastRead: usage.cache_read_input_tokens,
-        lastWrite: usage.cache_creation_input_tokens,
-        model: usage.model,
-      }))
-    }
+    // the turn's requests were added up as each one ended
+    void flushTotals($)
 
     const now = await $.clock.now()
     live = { chars: 0, firstAt: 0, phase: 'idle' }
@@ -1759,6 +1894,17 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    // saved under the ending session, which a later resume returns to
+    await flushTotals($)
+    if (e.reason === 'resume') {
+      // the process goes on as another session: its own totals load once its id is in place
+      try {
+        $.clock.after(1_000, () => void syncTotalsOwner($))
+      } catch {
+        // the next turn's start loads them
+      }
+      return next(e)
+    }
     if (e.reason !== 'clear') return next(e)
 
     await update($, totalsAtom, () => ({ ...EMPTY_TOTALS }))

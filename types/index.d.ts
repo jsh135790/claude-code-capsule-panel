@@ -8,6 +8,12 @@ export type UsageSnapshot = {
   changedAt?: number
 }
 
+/**
+ * Every request's usage this session, the main thread's and its subagents',
+ * added up as each response ends; `turns` counts the main thread's turns as
+ * they start. `sessionId` names the session the counts belong to, the key
+ * they are saved under so a resume picks them up.
+ */
 export type SessionTotals = {
   input: number
   output: number
@@ -18,6 +24,7 @@ export type SessionTotals = {
   lastRead: number
   lastWrite: number
   model?: string
+  sessionId?: string
 }
 
 export type ContextSlice = { label: string; tokens: number }

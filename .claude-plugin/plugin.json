@@ -1,6 +1,6 @@
 {
   "name": "capsule-panel",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Live usage dashboard: context, cache, rate limits, cost and activity in a capsule-style pane, plus a live band above the prompt while Claude works. Settings live in the pane, per surface.",
   "author": { "name": "jsh135790" },
   "homepage": "https://github.com/jsh135790/claude-code-capsule-panel",
