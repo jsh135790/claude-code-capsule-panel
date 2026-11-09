@@ -27,6 +27,47 @@ export type ContextBreakdown = {
   threshold?: number
 }
 
+/** The panel's options for one surface, kept in the plugin's own store. */
+export type PanelSettings = {
+  band: boolean
+  sound: boolean
+  notify: boolean
+  /** Seconds a turn runs before its end raises a notification. */
+  notifyAfterS: number
+  git: boolean
+  cacheTimer: boolean
+  cacheTtl: 'auto' | '5m' | '1h'
+  spend: boolean
+  compactForecast: boolean
+  versions: boolean
+  /** The terminal's icon set; other surfaces draw vector icons. */
+  icons: 'nerd' | 'unicode'
+}
+
+export type PaneView = 'dash' | 'settings'
+
+export type ModelInfo = { model?: string; effort?: string }
+
+export type Versions = { cli?: string; desktop?: string }
+
+/** When the main thread's prompt cache was last written or read, and the TTL `auto` resolves to. */
+export type CacheClock = { warmAt?: number; autoTtlMs: number }
+
+export type SpendTotals = { today: number; week: number; days: number[] }
+
+/**
+ * This session's spend for the local day `day` (`lastUsd - base`), the cost
+ * at the last measure, and what every other session and day in the store add;
+ * `owner` names this process's store keys.
+ */
+export type SpendState = { owner: string; day: string; base: number; lastUsd: number; others: SpendTotals }
+
+export type CompactRecord = { before?: number; after?: number; at: number }
+
+export type ChangedFile = { path: string; at: number }
+
+export type FileStat = { added: number; removed: number } | 'new'
+
 export type RateSample = { t: number; pct: number }
 
 export type ActivityStatus = 'running' | 'ok' | 'error'
@@ -55,6 +96,8 @@ export type GitInfo = {
   added: number
   removed: number
   files: number
+  /** Per repo-relative path: lines changed against HEAD, or `new` for an untracked file. */
+  fileStats?: Record<string, FileStat>
 }
 
 export type WorkState = { isWorking: boolean; startedAt?: number; animUntil: number }
@@ -69,8 +112,20 @@ declare module 'claude-code' {
     'capsule-panel': {
       snapshot: UsageSnapshot | null
       totals: SessionTotals
-      isBandHidden: boolean
       isPaneDismissed: boolean
+      /** Per surface (`terminal`, `desktop`), mirrored from the store. */
+      settings: Record<string, PanelSettings>
+      paneView: PaneView
+      modelInfo: ModelInfo
+      versions: Versions
+      cacheClock: CacheClock
+      spend: SpendState
+      /** The main thread's context tokens at the end of each recent turn. */
+      ctxHistory: number[]
+      lastCompact: CompactRecord | null
+      /** Until when a first press of "compact now" waits for the second. */
+      compactArmedUntil: number
+      files: ChangedFile[]
       now: number
       breakdown: ContextBreakdown | null
       rateSamples: Record<string, RateSample[]>

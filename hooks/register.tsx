@@ -4,7 +4,6 @@ import type {
   ButtonProps,
   ElementConstructor,
   EngineInterface,
-  PluginOptions,
   Register,
   RenderNode,
   SvgProps,
@@ -15,12 +14,18 @@ import type {
 import type {
   ActivityEntry,
   ActivityStatus,
+  CacheClock,
+  ChangedFile,
   ContextBreakdown,
+  FileStat,
   Frame,
   GitInfo,
   Phase,
   RateSample,
   SessionTotals,
+  PanelSettings,
+  SpendState,
+  SpendTotals,
   TodoItem,
   TodoStatus,
   UsageSnapshot,
@@ -44,8 +49,24 @@ const BURN_MIN_SPAN_MS = 5 * 60_000
 const CHARS_PER_TOKEN = 3.5
 const TOAST_MS = 8_000
 const DONE_SOUND = 'assets/done.wav'
-// tools that can change the work tree, and tools that start subagents (older builds name it Task)
+const NOTIFY_STEPS = [30, 60, 120, 300] as const
+const TTL_5M = 5 * 60_000
+const TTL_1H = 60 * 60_000
+const CACHE_LAST_MINUTE_MS = 60_000
+const SPEND_PREFIX = 'spend/'
+const SPEND_KEEP_DAYS = 14
+const SPEND_REFRESH_MS = 5 * 60_000
+const CTX_HISTORY = 6
+const COMPACT_ARM_MS = 3_000
+const COMPACT_SHOWN_MS = 15 * 60_000
+const MAX_FILES = 50
+const SHOWN_FILES = 5
+const FLASH_MS = 1_000
+const HOT_PCT = 80
+// tools that can change the work tree, tools that write a file, and tools that
+// start subagents (older builds name it Task)
 const GIT_TOOLS: ReadonlySet<string> = new Set(['Bash', 'PowerShell', 'Edit', 'Write', 'NotebookEdit'])
+const FILE_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'NotebookEdit'])
 const AGENT_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task'])
 // what tool.call carries beside the tool's own arguments
 const ENVELOPE_KEYS: ReadonlySet<string> = new Set(['tool', 'tool_use_id', 'agentId', 'consent'])
@@ -70,15 +91,64 @@ const C = {
   red: '#f38ba8',
 } as const
 
-// ── options ───────────────────────────────────────────────────────────────
+// ── settings ──────────────────────────────────────────────────────────────
+
+// Kept in the plugin's own store, not settings.json (which a provider switcher
+// may rewrite, and which Claude Desktop has no menu for), one set per surface.
+type SurfaceKey = 'terminal' | 'desktop'
+
+const surfaceKey = (surface: string): SurfaceKey => (surface === 'terminal' ? 'terminal' : 'desktop')
+
+const TERMINAL_DEFAULTS: PanelSettings = {
+  band: true,
+  sound: true,
+  notify: true,
+  notifyAfterS: 60,
+  git: true,
+  cacheTimer: true,
+  cacheTtl: 'auto',
+  spend: true,
+  compactForecast: true,
+  versions: true,
+  icons: 'nerd',
+}
+
+// Claude Desktop notifies and chimes on its own
+const DESKTOP_DEFAULTS: PanelSettings = { ...TERMINAL_DEFAULTS, sound: false, notify: false }
+
+const defaultsFor = (key: SurfaceKey): PanelSettings => (key === 'terminal' ? TERMINAL_DEFAULTS : DESKTOP_DEFAULTS)
+
+/** A stored value read over the defaults, field by field, so an old or partial one is safe. */
+const normalizeSettings = (raw: unknown, key: SurfaceKey): PanelSettings => {
+  const base = defaultsFor(key)
+  if (typeof raw !== 'object' || raw === null) return base
+  const r = raw as Record<string, unknown>
+  const bool = (k: keyof PanelSettings): boolean => (typeof r[k] === 'boolean' ? (r[k] as boolean) : (base[k] as boolean))
+  return {
+    band: bool('band'),
+    sound: bool('sound'),
+    notify: bool('notify'),
+    notifyAfterS: NOTIFY_STEPS.find(s => s === r.notifyAfterS) ?? base.notifyAfterS,
+    git: bool('git'),
+    cacheTimer: bool('cacheTimer'),
+    cacheTtl: r.cacheTtl === '5m' || r.cacheTtl === '1h' || r.cacheTtl === 'auto' ? r.cacheTtl : base.cacheTtl,
+    spend: bool('spend'),
+    compactForecast: bool('compactForecast'),
+    versions: bool('versions'),
+    icons: r.icons === 'unicode' || r.icons === 'nerd' ? r.icons : base.icons,
+  }
+}
+
+const settingsFor = (all: Readonly<Record<string, PanelSettings>>, surface: string): PanelSettings => {
+  const key = surfaceKey(surface)
+  return all[key] ?? defaultsFor(key)
+}
 
 type IconChoice = 'auto' | 'nerd' | 'unicode'
-type Options = { icons: IconChoice; isSoundOn: boolean }
 
-const parseOptions = (o: PluginOptions): Options => ({
-  icons: o.icons === 'nerd' || o.icons === 'unicode' ? o.icons : 'auto',
-  isSoundOn: o.sound !== false,
-})
+/** The icon set a surface draws with: the terminal's setting there, vector shapes elsewhere. */
+const iconChoice = (surface: string, settings: PanelSettings): IconChoice =>
+  surface === 'terminal' ? settings.icons : 'auto'
 
 // ── icons ─────────────────────────────────────────────────────────────────
 
@@ -105,6 +175,10 @@ const NERD = {
   brain: '\u{f09d1}',
   pen: '\uf040',
   wrench: '\uf0ad',
+  timer: '\uf252',
+  gear: '\uf013',
+  spend: '\uf073',
+  files: '\uf0f6',
 } as const
 
 type IconSet = { readonly [K in keyof typeof NERD]: string }
@@ -134,6 +208,10 @@ const UNICODE: IconSet = {
   brain: '✻',
   pen: '✎',
   wrench: '⚒',
+  timer: '⧗',
+  gear: '⚙',
+  spend: '▦',
+  files: '▤',
 }
 
 const PIE_NERD = ['\u{f0a9e}', '\u{f0a9f}', '\u{f0aa0}', '\u{f0aa1}', '\u{f0aa2}', '\u{f0aa3}', '\u{f0aa4}', '\u{f0aa5}']
@@ -178,6 +256,8 @@ const mix = (a: string, b: string, t: number): string => {
 
 const SPARK_COLORS = SPARK.map((_, i) => mix(C.teal, C.mauve, i / (SPARK.length - 1)))
 const BREATH = [0, 0.25, 0.5, 0.75, 1, 0.75, 0.5, 0.25].map(t => mix(C.teal, C.surface2, t))
+// a figure at or past HOT_PCT pulses while Claude works
+const RED_BREATH = [0, 0.25, 0.5, 0.75, 1, 0.75, 0.5, 0.25].map(t => mix(C.red, C.surface2, t * 0.6))
 
 const EMPTY_TOTALS: SessionTotals = {
   input: 0,
@@ -191,10 +271,22 @@ const EMPTY_TOTALS: SessionTotals = {
 }
 const IDLE_WORK: WorkState = { isWorking: false, animUntil: 0 }
 const IDLE_FRAME: Frame = { n: 0, at: 0, phase: 'idle' }
+const NO_SPEND: SpendTotals = { today: 0, week: 0, days: [0, 0, 0, 0, 0, 0, 0] }
+const FRESH_SPEND: SpendState = { owner: '', day: '', base: 0, lastUsd: 0, others: NO_SPEND }
+const FRESH_CACHE: CacheClock = { autoTtlMs: TTL_5M }
 
 const snapshotAtom = atom({ plugin: 'capsule-panel', key: 'snapshot' } as const, null)
 const totalsAtom = atom({ plugin: 'capsule-panel', key: 'totals' } as const, EMPTY_TOTALS)
-const bandHiddenAtom = atom({ plugin: 'capsule-panel', key: 'isBandHidden' } as const, false)
+const settingsAtom = atom({ plugin: 'capsule-panel', key: 'settings' } as const, {})
+const paneViewAtom = atom({ plugin: 'capsule-panel', key: 'paneView' } as const, 'dash')
+const modelInfoAtom = atom({ plugin: 'capsule-panel', key: 'modelInfo' } as const, {})
+const versionsAtom = atom({ plugin: 'capsule-panel', key: 'versions' } as const, {})
+const cacheAtom = atom({ plugin: 'capsule-panel', key: 'cacheClock' } as const, FRESH_CACHE)
+const spendAtom = atom({ plugin: 'capsule-panel', key: 'spend' } as const, FRESH_SPEND)
+const ctxHistoryAtom = atom({ plugin: 'capsule-panel', key: 'ctxHistory' } as const, [])
+const lastCompactAtom = atom({ plugin: 'capsule-panel', key: 'lastCompact' } as const, null)
+const compactArmedAtom = atom({ plugin: 'capsule-panel', key: 'compactArmedUntil' } as const, 0)
+const filesAtom = atom({ plugin: 'capsule-panel', key: 'files' } as const, [])
 const dismissedAtom = atom({ plugin: 'capsule-panel', key: 'isPaneDismissed' } as const, false)
 const nowAtom = atom({ plugin: 'capsule-panel', key: 'now' } as const, 0)
 const breakdownAtom = atom({ plugin: 'capsule-panel', key: 'breakdown' } as const, null)
@@ -245,6 +337,42 @@ const fmtSpan = (ms: number): string => {
   if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
   return `${m}m`
 }
+
+/** `claude-opus-5-5[1M]` → `opus-5.5`; `claude-haiku-4-5-20251001` → `haiku-4.5`. */
+const shortModel = (model: string): string =>
+  clean(
+    model
+      .replace(/^claude-/, '')
+      .replace(/\[.*\]$/, '')
+      .replace(/-\d{8}$/, '')
+      .replace(/-(\d+)-(\d+)$/, '-$1.$2'),
+    18,
+  )
+
+const effortText = (effort: string | number | undefined): string | undefined =>
+  effort === undefined ? undefined : typeof effort === 'number' ? `effort ${effort}` : effort
+
+const fmtUsd = (usd: number): string => (usd >= 100 ? `$${Math.round(usd)}` : `$${usd.toFixed(2)}`)
+
+/** The last minute of a countdown, `0:42`. */
+const fmtClock = (ms: number): string => `0:${String(Math.max(0, Math.ceil(ms / 1000))).padStart(2, '0')}`
+
+const pad2 = (n: number): string => String(n).padStart(2, '0')
+
+/** The local calendar day of a time, `2026-11-09`; such strings sort as dates. */
+const localDay = (ms: number): string => {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+}
+
+/** The local day `n` days before the day of `ms`. */
+const dayBefore = (ms: number, n: number): string => {
+  const d = new Date(ms)
+  return localDay(new Date(d.getFullYear(), d.getMonth(), d.getDate() - n, 12).getTime())
+}
+
+/** The Monday that starts the week of `ms`. */
+const weekStart = (ms: number): string => dayBefore(ms, (new Date(ms).getDay() + 6) % 7)
 
 const pctText = (pct: number | undefined): string => (pct === undefined ? '—' : `${Math.round(pct)}%`)
 
@@ -424,10 +552,28 @@ const parseGitStatus = (out: string): Omit<GitInfo, 'added' | 'removed'> => {
   return { branch: branch === '(detached)' ? 'detached' : branch, ahead, behind, files }
 }
 
-const parseShortstat = (out: string): { added: number; removed: number } => ({
-  added: Number(/(\d+) insertion/.exec(out)?.[1] ?? '0'),
-  removed: Number(/(\d+) deletion/.exec(out)?.[1] ?? '0'),
-})
+/** `git diff --numstat` lines, per repo-relative path; a binary file counts no lines. */
+const parseNumstat = (out: string): Record<string, FileStat> => {
+  const stats: Record<string, FileStat> = {}
+  for (const line of out.split('\n')) {
+    const m = /^(\d+|-)\t(\d+|-)\t(.+?)\r?$/.exec(line)
+    if (m?.[3] !== undefined) stats[m[3]] = { added: Number(m[1]) || 0, removed: Number(m[2]) || 0 }
+  }
+  return stats
+}
+
+const untrackedPaths = (status: string): string[] =>
+  status
+    .split('\n')
+    .filter(l => l.startsWith('? '))
+    .map(l => l.slice(2).trim())
+
+/** A changed file's line counts, matched by its repo-relative path's suffix. */
+const statFor = (path: string, stats: Readonly<Record<string, FileStat>> | undefined): FileStat | undefined => {
+  if (stats === undefined) return undefined
+  for (const [rel, s] of Object.entries(stats)) if (path === rel || path.endsWith(`/${rel}`)) return s
+  return undefined
+}
 
 // ── todos ─────────────────────────────────────────────────────────────────
 
@@ -495,12 +641,20 @@ const refreshGit = async ($: EngineInterface): Promise<void> => {
       return
     }
     const info = parseGitStatus(status.stdout)
-    const diff = await $.process.run(['git', '--no-optional-locks', 'diff', '--shortstat', 'HEAD'], {
+    const diff = await $.process.run(['git', '--no-optional-locks', 'diff', '--numstat', 'HEAD'], {
       cwd,
       timeoutMs: 5_000,
     })
-    const stat = diff.exitCode === 0 ? parseShortstat(diff.stdout) : { added: 0, removed: 0 }
-    await update($, gitAtom, () => ({ ...info, ...stat }))
+    const stats = diff.exitCode === 0 ? parseNumstat(diff.stdout) : {}
+    let added = 0
+    let removed = 0
+    for (const s of Object.values(stats)) {
+      if (s === 'new') continue
+      added += s.added
+      removed += s.removed
+    }
+    for (const path of untrackedPaths(status.stdout)) stats[path] = 'new'
+    await update($, gitAtom, () => ({ ...info, added, removed, fileStats: stats }))
   } catch {
     // no git on PATH: the section stays hidden
   }
@@ -563,6 +717,228 @@ const warnOnBurn = async (
     })
     await update($, warningsAtom, w => ({ ...w, [l.kind]: window }))
   }
+}
+
+// ── settings, cache, spend, notifications, files ──────────────────────────
+
+const settingsKey = (key: SurfaceKey): string => `settings.${key}`
+
+/** Reads both surfaces' settings from the store into the session's state. */
+const loadSettings = async ($: EngineInterface): Promise<void> => {
+  const loaded: Record<string, PanelSettings> = {}
+  for (const key of ['terminal', 'desktop'] as const) {
+    let raw: unknown
+    try {
+      raw = await $.store.get(settingsKey(key))
+    } catch {
+      raw = undefined
+    }
+    loaded[key] = normalizeSettings(raw, key)
+  }
+  await update($, settingsAtom, () => loaded)
+}
+
+/** Changes one surface's settings, in the session and in the store. */
+const changeSettings = async ($: EngineInterface, surface: string, patch: Partial<PanelSettings>): Promise<void> => {
+  const key = surfaceKey(surface)
+  const all = await update($, settingsAtom, prev => ({ ...prev, [key]: { ...settingsFor(prev, key), ...patch } }))
+  try {
+    await $.store.set(settingsKey(key), all[key])
+  } catch {
+    // kept for this session
+  }
+}
+
+/** The settings of the surface the session draws on first: what an event with no surface of its own follows. */
+const primarySettings = async ($: EngineInterface): Promise<PanelSettings> => {
+  let surface = 'terminal'
+  try {
+    surface = (await $.session.surfaces())[0] ?? 'terminal'
+  } catch {
+    // a host with no surfaces: the terminal's
+  }
+  return settingsFor(await read($, settingsAtom), surface)
+}
+
+const HOST_ENTRYPOINTS: ReadonlySet<string> = new Set(['claude-desktop', 'claude-desktop-3p', 'local-agent'])
+
+const parseTtl = (v: unknown): number | undefined => (v === '1h' ? TTL_1H : v === '5m' ? TTL_5M : undefined)
+
+/**
+ * The prompt-cache TTL the engine sends, by its own rule (2.1.317): forced 5m,
+ * then an explicit TTL, then forced 1h, then 1h for a claude.ai subscriber (a
+ * key in the environment makes a terminal session an API session), else 5m.
+ */
+const resolveAutoTtl = async ($: EngineInterface): Promise<number> => {
+  try {
+    if ((await $.env.get('FORCE_PROMPT_CACHING_5M')) !== undefined) return TTL_5M
+    const forced = parseTtl(await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'))
+    if (forced !== undefined) return forced
+    const configured = parseTtl(await $.settings.read({ key: 'promptCacheTtl' }).catch(() => undefined))
+    if (configured !== undefined) return configured
+    if ((await $.env.get('ENABLE_PROMPT_CACHING_1H')) !== undefined) return TTL_1H
+    const entry = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) ?? ''
+    const isHost = HOST_ENTRYPOINTS.has(entry) || (await $.env.get('CLAUDE_CODE_REMOTE')) !== undefined
+    const hasKey =
+      (await $.env.get('ANTHROPIC_AUTH_TOKEN')) !== undefined || (await $.env.get('ANTHROPIC_API_KEY')) !== undefined
+    if (hasKey && !isHost) return TTL_5M
+    const scopes = await $.env.get('CLAUDE_CODE_OAUTH_SCOPES')
+    if (scopes !== undefined) return scopes.includes('user:inference') ? TTL_1H : TTL_5M
+    return TTL_1H
+  } catch {
+    return TTL_5M
+  }
+}
+
+const ttlFor = (settings: PanelSettings, cache: CacheClock): number =>
+  settings.cacheTtl === '5m' ? TTL_5M : settings.cacheTtl === '1h' ? TTL_1H : cache.autoTtlMs
+
+let cacheTimers: Timer[] = []
+
+/** Redraws once a second through the cache's last minute, so the countdown shows seconds. */
+const scheduleCacheTick = async ($: EngineInterface): Promise<void> => {
+  for (const t of cacheTimers) t.cancel()
+  cacheTimers = []
+  const cache = await read($, cacheAtom)
+  if (cache.warmAt === undefined) return
+  const expiresAt = cache.warmAt + ttlFor(await primarySettings($), cache)
+  const now = await $.clock.now()
+  if (now > expiresAt) return
+  cacheTimers.push(
+    $.clock.after(Math.max(0, expiresAt - CACHE_LAST_MINUTE_MS - now), () => {
+      const every = $.clock.every(1_000, () => {
+        void (async () => {
+          const t = await $.clock.now()
+          await update($, nowAtom, () => t)
+          if (t > expiresAt + 1_000) every.cancel()
+        })()
+      })
+      cacheTimers.push(every)
+    }),
+  )
+}
+
+let lastSpendRefresh = 0
+
+/** Sums what the store holds for every other session and day: today, this week, the last 7 days. */
+const refreshSpend = async ($: EngineInterface, isPruning: boolean): Promise<void> => {
+  try {
+    const now = await $.clock.now()
+    lastSpendRefresh = now
+    const sid = (await read($, spendAtom)).owner
+    const today = localDay(now)
+    const monday = weekStart(now)
+    const last7 = Array.from({ length: 7 }, (_, i) => dayBefore(now, 6 - i))
+    const oldest = dayBefore(now, SPEND_KEEP_DAYS)
+    const own = `${SPEND_PREFIX}${today}/${sid}`
+    const others: SpendTotals = { today: 0, week: 0, days: [0, 0, 0, 0, 0, 0, 0] }
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(SPEND_PREFIX)) continue
+      const day = key.slice(SPEND_PREFIX.length, SPEND_PREFIX.length + 10)
+      if (day < oldest) {
+        if (isPruning) await $.store.delete(key)
+        continue
+      }
+      if (key === own) continue
+      const usd = await $.store.get(key)
+      if (typeof usd !== 'number' || !(usd > 0)) continue
+      if (day === today) others.today += usd
+      if (day >= monday) others.week += usd
+      const i = last7.indexOf(day)
+      if (i >= 0) others.days[i] = (others.days[i] ?? 0) + usd
+    }
+    await update($, spendAtom, s => ({ ...s, others }))
+  } catch {
+    // no store: the row counts this session alone
+  }
+}
+
+/**
+ * Names this process's spend keys once: kept in the session's state, so a
+ * reload or a /clear keeps booking to the same keys.
+ */
+const ensureSpendOwner = async ($: EngineInterface, now: number): Promise<void> => {
+  await update($, spendAtom, s =>
+    s.owner !== '' ? s : { ...s, owner: `${now.toString(36)}${Math.random().toString(36).slice(2, 6)}` },
+  )
+}
+
+/** Books this session's cost against the local day, one store key per day and session. */
+const recordSpend = async ($: EngineInterface, usd: number, now: number): Promise<void> => {
+  const day = localDay(now)
+  const was = await read($, spendAtom)
+  if (was.day === day && was.lastUsd === usd) return
+  await ensureSpendOwner($, now)
+  const s = await update($, spendAtom, prev => {
+    // a new day starts from the cost so far; a counter that went back keeps what was booked
+    const base =
+      prev.day === '' ? 0 : prev.day !== day ? prev.lastUsd : usd < prev.lastUsd ? usd - (prev.lastUsd - prev.base) : prev.base
+    return { ...prev, day, base, lastUsd: usd }
+  })
+  const spent = s.lastUsd - s.base
+  if (spent > 0) {
+    try {
+      await $.store.set(`${SPEND_PREFIX}${day}/${s.owner}`, Math.round(spent * 10_000) / 10_000)
+    } catch {
+      // counted for this session only
+    }
+  }
+  // past midnight, what the other sessions spent "today" was yesterday's
+  if (was.day !== '' && was.day !== day) await refreshSpend($, false)
+}
+
+/** Today, this week and the last 7 days, this session included. */
+const spendShown = (s: SpendState, now: number): SpendTotals => {
+  const mine = s.day === localDay(now) ? Math.max(0, s.lastUsd - s.base) : 0
+  const days = [...s.others.days]
+  days[days.length - 1] = (days[days.length - 1] ?? 0) + mine
+  return { today: s.others.today + mine, week: s.others.week + mine, days }
+}
+
+// Windows PowerShell's own AppUserModelID, so the toast needs no registration
+const POWERSHELL_APP_ID = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
+
+const psQuote = (s: string): string => `'${s.replace(/'/g, "''")}'`
+
+/** A PowerShell script raising a two-line Windows toast through the built-in WinRT API. */
+const toastScript = (title: string, body: string): string =>
+  [
+    "$ErrorActionPreference = 'Stop'",
+    '[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]',
+    '$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)',
+    "$t = $x.GetElementsByTagName('text')",
+    `[void]$t.Item(0).AppendChild($x.CreateTextNode(${psQuote(title)}))`,
+    `[void]$t.Item(1).AppendChild($x.CreateTextNode(${psQuote(body)}))`,
+    `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(${psQuote(POWERSHELL_APP_ID)}).Show([Windows.UI.Notifications.ToastNotification]::new($x))`,
+  ].join('; ')
+
+/** Tells the person a long turn is done: a Windows toast, else their own notification channel. */
+const notifyDone = async ($: EngineInterface, durationMs: number, answer: string): Promise<void> => {
+  let cwd = ''
+  try {
+    cwd = await $.session.cwd()
+  } catch {
+    // titled without the folder
+  }
+  const title = `Claude Code · ${basename(cwd) || 'session'}`
+  const said = clean(answer, 80)
+  const body = `done in ${fmtSeconds(durationMs)}${said === '' ? '' : ` · ${said}`}`
+  if ((await $.env.get('OS')) === 'Windows_NT') {
+    await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', toastScript(title, body)], {
+      timeoutMs: 15_000,
+    })
+  } else {
+    await $.ui.notify(body, { title })
+  }
+}
+
+/** Notes a file a successful write tool changed, newest last, its path with forward slashes. */
+const recordFile = async ($: EngineInterface, args: Readonly<Record<string, unknown>>): Promise<void> => {
+  const raw = typeof args.file_path === 'string' ? args.file_path : args.notebook_path
+  if (typeof raw !== 'string' || raw === '') return
+  const path = raw.replace(/\\/g, '/')
+  const at = await $.clock.now()
+  await update($, filesAtom, list => [...list.filter(f => f.path !== path), { path, at }].slice(-MAX_FILES))
 }
 
 // ── drawing helpers ───────────────────────────────────────────────────────
@@ -744,6 +1120,10 @@ type IconName =
   | 'agent'
   | 'branch'
   | 'todo'
+  | 'timer'
+  | 'gear'
+  | 'spend'
+  | 'files'
 
 const dot = (cx: number, cy: number, r: number, c: string) =>
   `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${c}" stroke="none"/>`
@@ -769,6 +1149,13 @@ const ICON_SHAPES: { readonly [K in IconName]: (c: string) => string } = {
   branch: () =>
     `<path d="M6 3V15"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9A9 9 0 0 1 9 18"/>`,
   todo: () => `<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12.5L11 15.5L16.5 9.5"/>`,
+  timer: () => `<circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5V13.5L14.5 15M9.5 2.5H14.5M12 2.5V6"/>`,
+  gear: () =>
+    `<circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2.2"/>` +
+    `<path d="M12 2.5V6M12 18V21.5M2.5 12H6M18 12H21.5M5.3 5.3L7.8 7.8M16.2 16.2L18.7 18.7M5.3 18.7L7.8 16.2M16.2 7.8L18.7 5.3"/>`,
+  spend: () => `<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M3 10H21M8 3V7M16 3V7"/>`,
+  files: () =>
+    `<path d="M14 3H7A3 3 0 0 0 4 6V18A3 3 0 0 0 7 21H17A3 3 0 0 0 20 18V9Z"/><path d="M14 3V9H20M8 13H16M8 17H13"/>`,
 }
 
 const iconSvg = (name: IconName, color: string): string =>
@@ -835,6 +1222,7 @@ const contextCells = (
   breakdown: ContextBreakdown | null,
   windowTokens: number,
   shimmer: number | undefined,
+  fill: string = thresholdColor(pct),
 ): Cell[] => {
   const filled = Math.round((width * clampPct(pct)) / 100)
   const cells: Cell[] = []
@@ -855,7 +1243,7 @@ const contextCells = (
       for (let k = 0; k < (alloc[i] ?? 0); k++) cells.push({ ch: LINE, color: sliceColor(s.label) })
     })
   } else {
-    for (let k = 0; k < filled; k++) cells.push({ ch: LINE, color: thresholdColor(pct) })
+    for (let k = 0; k < filled; k++) cells.push({ ch: LINE, color: fill })
   }
   while (cells.length < width) cells.push({ ch: LINE, color: C.surface1 })
 
@@ -907,11 +1295,154 @@ const phaseLook = (phase: Phase, icons: IconSet, spin: PillIcon): { icon: PillIc
   }
 }
 
+// ── compaction ────────────────────────────────────────────────────────────
+
+/** The average rise of the context per turn, over the recent turns that grew it. */
+const growthPerTurn = (history: readonly number[]): number | undefined => {
+  const rises = history.slice(1).flatMap((v, i) => {
+    const d = v - (history[i] ?? v)
+    return d > 0 ? [d] : []
+  })
+  return rises.length === 0 ? undefined : rises.reduce((a, b) => a + b, 0) / rises.length
+}
+
+/** What the forecast line says: a recent compaction, else how many turns until the auto-compact. */
+const compactNote = (
+  last: { before?: number; after?: number; at: number } | null,
+  threshold: number | undefined,
+  tokens: number | undefined,
+  history: readonly number[],
+  clock: number,
+): string | undefined => {
+  if (last !== null && clock - last.at < COMPACT_SHOWN_MS) {
+    return last.before !== undefined && last.after !== undefined
+      ? `compacted ${fmtTokens(last.before)} → ${fmtTokens(last.after)}`
+      : 'compacted'
+  }
+  if (threshold === undefined || tokens === undefined) return undefined
+  if (tokens >= threshold) return 'auto-compact due'
+  const growth = growthPerTurn(history)
+  if (growth === undefined) return undefined
+  const turns = Math.max(1, Math.ceil((threshold - tokens) / growth))
+  return `≈${turns} turn${turns === 1 ? '' : 's'} to auto-compact`
+}
+
+/** Notes a compaction: the forecast line shows it for a while, and the growth history starts over. */
+const noteCompaction = async ($: EngineInterface, before: number | undefined, after: number | undefined): Promise<void> => {
+  const at = await $.clock.now()
+  await update($, lastCompactAtom, () => ({ before, after, at }))
+  await update($, ctxHistoryAtom, () => [])
+  void refreshBreakdown($)
+}
+
+/**
+ * "compact now": the first press arms it for a few seconds, the second
+ * compacts. A plugin's own compaction passes by its own session.compact hook,
+ * so the result is noted here.
+ */
+const pressCompact = async ($: EngineInterface): Promise<void> => {
+  const now = await $.clock.now()
+  // an arm a reload orphaned has lapsed all the same
+  if ((await read($, compactArmedAtom)) < now) {
+    const until = now + COMPACT_ARM_MS
+    await update($, compactArmedAtom, () => until)
+    $.clock.after(COMPACT_ARM_MS, () => {
+      void update($, compactArmedAtom, v => (v === until ? 0 : v))
+    })
+    return
+  }
+  await update($, compactArmedAtom, () => 0)
+  try {
+    const result = await $.session.compact()
+    if (result.skip !== undefined) $.ui.toast(`Compact skipped: ${result.skip}`)
+    else await noteCompaction($, result.tokensBefore, result.tokensAfter)
+  } catch (error) {
+    $.ui.toast(`Compact failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+// ── settings page ─────────────────────────────────────────────────────────
+
+type SettingRow = { id: string; label: string; value: string; isOn: boolean; patch: Partial<PanelSettings> }
+
+const nextOf = <T,>(list: readonly T[], value: T): T => list[(list.indexOf(value) + 1) % list.length] ?? value
+
+const settingRows = (surface: string, s: PanelSettings, cache: CacheClock): SettingRow[] => {
+  const flag = (id: 'band' | 'sound' | 'notify' | 'git' | 'cacheTimer' | 'spend' | 'compactForecast' | 'versions', label: string) => ({
+    id,
+    label,
+    value: s[id] ? 'on' : 'off',
+    isOn: s[id],
+    patch: { [id]: !s[id] },
+  })
+  const rows: SettingRow[] = [
+    flag('band', 'Activity band'),
+    flag('sound', 'Completion sound'),
+    flag('notify', 'Long-turn notification'),
+    {
+      id: 'notifyAfterS',
+      label: '  after',
+      value: `${s.notifyAfterS}s`,
+      isOn: s.notify,
+      patch: { notifyAfterS: nextOf<number>(NOTIFY_STEPS, s.notifyAfterS) },
+    },
+    flag('git', 'Git & changed files'),
+    flag('cacheTimer', 'Cache countdown'),
+    {
+      id: 'cacheTtl',
+      label: '  TTL',
+      value: s.cacheTtl === 'auto' ? `auto (${cache.autoTtlMs === TTL_1H ? '1h' : '5m'})` : s.cacheTtl,
+      isOn: s.cacheTimer,
+      patch: { cacheTtl: nextOf(['auto', '5m', '1h'] as const, s.cacheTtl) },
+    },
+    flag('spend', 'Today / week spend'),
+    flag('compactForecast', 'Compact forecast'),
+    flag('versions', 'Versions'),
+  ]
+  if (surface === 'terminal') {
+    rows.push({
+      id: 'icons',
+      label: 'Icons',
+      value: s.icons,
+      isOn: true,
+      patch: { icons: s.icons === 'nerd' ? 'unicode' : 'nerd' },
+    })
+  }
+  return rows
+}
+
+const surfaceName = (surface: string): string => (surface === 'terminal' ? 'the terminal' : 'Claude Desktop')
+
+/** The settings page that takes the pane's place while it is open: this surface's settings. */
+const settingsPage = ($: EngineInterface, ui: Ui, look: Look, surface: string, s: PanelSettings, cache: CacheClock) => (
+  <ui.Box flexDirection="column" paddingX={1}>
+    <ui.Button key="settings-back" plain dimColor label="← back" onPress={() => update($, paneViewAtom, () => 'dash')} />
+    {gap(ui)}
+    {sectionHeader(ui, look, 'gear', 'SETTINGS', C.mauve)}
+    {settingRows(surface, s, cache).map(r => (
+      <ui.Box flexDirection="row" justifyContent="space-between" alignItems="center">
+        <ui.Text color={r.isOn ? C.text : C.overlay0} wrap="truncate-end">
+          {r.label}
+        </ui.Text>
+        <ui.Button
+          key={`set-${r.id}`}
+          plain
+          dimColor={!r.isOn}
+          label={r.value}
+          onPress={() => changeSettings($, surface, r.patch)}
+        />
+      </ui.Box>
+    ))}
+    {gap(ui)}
+    <ui.Text color={C.overlay0} size="footnote">
+      {`These apply to ${surfaceName(surface)} only.`}
+    </ui.Text>
+  </ui.Box>
+)
+
 // ── hooks ─────────────────────────────────────────────────────────────────
 
-export const register: Register = (on, options) => {
-  const opts = parseOptions(options)
-
+export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     try {
       await $.command.register({ name: 'panel', description: 'Toggle the usage panel', immediate: true })
@@ -920,6 +1451,7 @@ export const register: Register = (on, options) => {
     }
 
     void (async () => {
+      await loadSettings($)
       try {
         const usage = await $.session.usage()
         const model = await $.session.model()
@@ -933,10 +1465,32 @@ export const register: Register = (on, options) => {
           changedAt: old?.changedAt,
         }))
         await update($, totalsAtom, prev => ({ ...prev, model: prev.model ?? model }))
+        await update($, modelInfoAtom, prev => ({ ...prev, model: prev.model ?? model }))
         await update($, nowAtom, () => now)
+        // a resumed session's cost so far was booked by the session that spent it
+        const usd = usage.cost?.usd ?? 0
+        await update($, spendAtom, s => (s.day === '' ? { ...s, day: localDay(now), base: usd, lastUsd: usd } : s))
+        await ensureSpendOwner($, now)
       } catch {
         // placeholders stay until session.measure fills them
       }
+      try {
+        const effort = await $.env.get('CLAUDE_EFFORT')
+        if (effort !== undefined) await update($, modelInfoAtom, prev => ({ ...prev, effort: prev.effort ?? effort }))
+      } catch {
+        // the first turn names it
+      }
+      try {
+        const { version, base } = await $.session.version()
+        const desktop = await $.env.get('CLAUDE_CODE_DESKTOP_APP_VERSION').catch(() => undefined)
+        await update($, versionsAtom, () => ({ cli: base ?? version, desktop }))
+      } catch {
+        // the footer leaves them out
+      }
+      const autoTtlMs = await resolveAutoTtl($)
+      await update($, cacheAtom, c => ({ ...c, autoTtlMs }))
+      await scheduleCacheTick($)
+      await refreshSpend($, true)
       await refreshAgents($)
       await refreshGit($)
       await refreshBreakdown($)
@@ -951,6 +1505,9 @@ export const register: Register = (on, options) => {
       void (async () => {
         const now = await $.clock.now()
         await update($, nowAtom, () => now)
+        if (now - lastSpendRefresh >= SPEND_REFRESH_MS || localDay(now) !== localDay(lastSpendRefresh)) {
+          await refreshSpend($, false)
+        }
       })()
     })
 
@@ -992,6 +1549,7 @@ export const register: Register = (on, options) => {
       const samples = await update($, samplesAtom, s => addSamples(s, e.rateLimits, now))
       await warnOnBurn($, e.rateLimits, samples, now)
     }
+    if (e.cost !== undefined) await recordSpend($, e.cost.usd, now)
     await update($, workAtom, w => ({ ...w, animUntil: Math.max(w.animUntil, now + TWEEN_MS + 2 * TICK_MS) }))
     ensureTicker($)
 
@@ -1022,6 +1580,12 @@ export const register: Register = (on, options) => {
     const stream = next(e)
     if (e.agentId !== undefined) return yield* stream
 
+    const effort = effortText(e.effort)
+    const info = await read($, modelInfoAtom)
+    if (info.model !== e.model || (effort !== undefined && info.effort !== effort)) {
+      await update($, modelInfoAtom, prev => ({ model: e.model, effort: effort ?? prev.effort }))
+    }
+
     let firstAt = 0
     for await (const chunk of stream) {
       if (chunk.kind === 'text' || chunk.kind === 'thinking' || chunk.kind === 'input') {
@@ -1035,6 +1599,9 @@ export const register: Register = (on, options) => {
       } else if (chunk.kind === 'tool') {
         live.phase = 'tool-input'
       } else if (chunk.kind === 'stop') {
+        // the request wrote or read the prompt cache: its TTL runs from here
+        const stoppedAt = await $.clock.now()
+        await update($, cacheAtom, c => ({ ...c, warmAt: stoppedAt }))
         const out = chunk.usage?.output_tokens
         if (out !== undefined && firstAt > 0) {
           const secs = ((await $.clock.now()) - firstAt) / 1000
@@ -1052,7 +1619,16 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
+    if (e.agentId !== undefined) {
+      // a subagent's calls stay out of the activity list, but its edits are changes all the same
+      if (!FILE_TOOLS.has(e.tool)) return next(e)
+      const done = await next(e)
+      if (done.deny === undefined && done.isError !== true) {
+        await recordFile($, e as unknown as Readonly<Record<string, unknown>>)
+        scheduleGit($)
+      }
+      return done
+    }
 
     const args = e as unknown as Readonly<Record<string, unknown>>
     const startedAt = await $.clock.now()
@@ -1084,6 +1660,7 @@ export const register: Register = (on, options) => {
     await finish(hasFailed ? 'error' : 'ok')
 
     if (!hasFailed) {
+      if (FILE_TOOLS.has(e.tool)) await recordFile($, args)
       if (e.tool === 'TodoWrite') {
         const todos = todosFromWrite(args.todos)
         if (todos !== undefined) await update($, todosAtom, () => todos)
@@ -1163,9 +1740,19 @@ export const register: Register = (on, options) => {
     scheduleGit($)
     void refreshAgents($)
 
+    const tokens = (await read($, snapshotAtom))?.context.tokens
+    if (tokens !== undefined) await update($, ctxHistoryAtom, h => [...h, tokens].slice(-CTX_HISTORY))
+    // the turn's last request just read or wrote the cache
+    await update($, cacheAtom, c => ({ ...c, warmAt: now }))
+    void scheduleCacheTick($)
+
+    const settings = await primarySettings($)
     // a Windows terminal has no player and plays nothing; elsewhere a short tone
-    if (opts.isSoundOn && !e.isAborted) {
+    if (settings.sound && !e.isAborted) {
       void $.audio.play({ asset: DONE_SOUND }, { gain: 0.6 }).catch(() => undefined)
+    }
+    if (settings.notify && e.reason === 'answer' && e.durationMs >= settings.notifyAfterS * 1000) {
+      void notifyDone($, e.durationMs, e.answer).catch(() => undefined)
     }
 
     return next(e)
@@ -1180,15 +1767,30 @@ export const register: Register = (on, options) => {
     await update($, activityAtom, () => [])
     await update($, streamAtom, () => ({ rates: [] }))
     await update($, todosAtom, () => [])
+    await update($, filesAtom, () => [])
+    await update($, ctxHistoryAtom, () => [])
+    await update($, lastCompactAtom, () => null)
+    await update($, cacheAtom, c => ({ autoTtlMs: c.autoTtlMs }))
     return next(e)
+  })
+
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined || e.trigger === 'precompute' || result.skip !== undefined) return result
+    await noteCompaction($, result.tokensBefore, result.tokensAfter)
+    return result
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const ui: Ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
-    const look = lookFor(e.surface, opts.icons)
+    const settings = settingsFor(await read($, settingsAtom), e.surface)
+    const look = lookFor(e.surface, iconChoice(e.surface, settings))
     const { icons } = look
-    const [snapshot, totals, breakdown, samples, activity, stream, agents, todos, git, work, frame, bandHidden, now] =
+    if ((await read($, paneViewAtom)) === 'settings') {
+      return settingsPage($, ui, look, e.surface, settings, await read($, cacheAtom))
+    }
+    const [snapshot, totals, breakdown, samples, activity, stream, agents, todos, git, work, frame, now] =
       await Promise.all([
         read($, snapshotAtom),
         read($, totalsAtom),
@@ -1201,19 +1803,36 @@ export const register: Register = (on, options) => {
         read($, gitAtom),
         read($, workAtom),
         read($, frameAtom),
-        read($, bandHiddenAtom),
         read($, nowAtom),
       ])
+    const [modelInfo, versions, cache, spend, ctxHistory, lastCompact, compactArmed, files] = await Promise.all([
+      read($, modelInfoAtom),
+      read($, versionsAtom),
+      read($, cacheAtom),
+      read($, spendAtom),
+      read($, ctxHistoryAtom),
+      read($, lastCompactAtom),
+      read($, compactArmedAtom),
+      read($, filesAtom),
+    ])
 
     const W = Math.max(28, e.props.bodyColumns - 2)
     const clock = Math.max(now, frame.at)
     const isWorking = work.isWorking
     const t = tweenProgress(snapshot, frame.at)
+    const breath = RED_BREATH[frame.n % RED_BREATH.length] ?? C.red
+    // a figure at or past HOT_PCT pulses while Claude works, and holds still red otherwise
+    const hotColor = (pct: number | undefined): string =>
+      isWorking && (pct ?? 0) >= HOT_PCT ? breath : thresholdColor(pct)
 
     // header
     const startedAt = snapshot?.startedAt
     const elapsed = startedAt === undefined ? '—' : fmtElapsed(clock - startedAt)
     const liveColor = isWorking ? (BREATH[frame.n % BREATH.length] ?? C.teal) : C.overlay0
+    const model = modelInfo.model ?? totals.model
+    const modelLine = [model === undefined ? undefined : shortModel(model), modelInfo.effort]
+      .filter((x): x is string => x !== undefined && x !== '')
+      .join(' · ')
 
     // context
     const ctx = snapshot?.context
@@ -1221,37 +1840,66 @@ export const register: Register = (on, options) => {
     const pctShown = tween(snapshot?.prev?.percent, pct, t)
     const tokShown = tween(snapshot?.prev?.tokens, ctx?.tokens, t)
     const legend = [...(breakdown?.slices ?? [])].sort((a, b) => b.tokens - a.tokens).slice(0, 4)
+    const note = settings.compactForecast
+      ? compactNote(lastCompact, breakdown?.threshold, ctx?.tokens, ctxHistory, clock)
+      : undefined
+    const showsCompact = settings.compactForecast && !isWorking && ctx?.tokens !== undefined
+    const isArmed = compactArmed > clock
 
     // usage
     const hit = hitRate(totals.cacheRead, totals.cacheWrite, totals.input)
     const hitColor = hit === undefined ? C.overlay0 : hit >= 70 ? C.green : hit >= 40 ? C.yellow : C.peach
+    const warmLeft =
+      settings.cacheTimer && !isWorking && cache.warmAt !== undefined
+        ? cache.warmAt + ttlFor(settings, cache) - clock
+        : undefined
     const costShown = tween(snapshot?.prev?.costUsd, snapshot?.costUsd, t)
     const hours = startedAt === undefined ? 0 : (clock - startedAt) / 3_600_000
     const limits = snapshot?.rateLimits ?? []
     const perHour = hours >= 1 / 30 && snapshot?.costUsd !== undefined ? snapshot.costUsd / hours : undefined
     const tokTotal = totals.input + totals.output + totals.cacheRead + totals.cacheWrite
     const tokPerHour = hours >= 1 / 30 ? tokTotal / hours : undefined
+    const spent = spendShown(spend, clock)
+    const showsSpend = settings.spend && (snapshot?.costUsd !== undefined || spent.week > 0)
 
     // activity
     const lastRate = stream.rates[stream.rates.length - 1]
     const shownRate = isWorking && frame.liveRate !== undefined ? frame.liveRate : lastRate
     const recent = activity.slice(-SHOWN_ACTIVITY).reverse()
 
+    // changes
+    const showsGit = settings.git && git !== null
+    const changed = settings.git ? [...files].reverse() : []
+
     // todos
     const done = todos.filter(x => x.status === 'completed').length
     const current = todos.find(x => x.status === 'in_progress')
 
     const limitBarW = Math.max(6, W - 27)
+    const versionLine = settings.versions
+      ? [versions.cli === undefined ? '' : `CC ${versions.cli}`, versions.desktop === undefined ? '' : `Desktop ${versions.desktop}`]
+          .filter(x => x !== '')
+          .join(' · ')
+      : ''
 
     return (
       <Box flexDirection="column" paddingX={1}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          {pill(ui, look, { glyph: icons.sparkle, shape: 'sparkle' }, 'USAGE', C.mauve)}
-          <Text>
-            <Text color={liveColor}>{isWorking ? icons.dot : icons.dotIdle}</Text>
-            <Text color={isWorking ? C.teal : C.overlay0}>{isWorking ? ' live' : ' idle'}</Text>
-            <Text color={C.overlay0} tabular>{`  ${elapsed}`}</Text>
-          </Text>
+          <Box flexDirection="row" alignItems="center" flexShrink={1} minWidth={0}>
+            {pill(ui, look, { glyph: icons.sparkle, shape: 'sparkle' }, 'USAGE', C.mauve)}
+            {modelLine !== '' && (
+              <Text color={C.overlay0} wrap="truncate-end">
+                {` ${modelLine}`}
+              </Text>
+            )}
+          </Box>
+          <Box flexShrink={0}>
+            <Text wrap="truncate-end">
+              <Text color={liveColor}>{isWorking ? icons.dot : icons.dotIdle}</Text>
+              <Text color={isWorking ? C.teal : C.overlay0}>{isWorking ? ' live' : ' idle'}</Text>
+              <Text color={C.overlay0} tabular>{`  ${elapsed}`}</Text>
+            </Text>
+          </Box>
         </Box>
         {gap(ui)}
 
@@ -1261,18 +1909,21 @@ export const register: Register = (on, options) => {
           'context',
           'CONTEXT',
           thresholdColor(pct),
-          <Text tabular>
+          <Text tabular wrap="truncate-end">
             <Text color={C.subtext}>
               {ctx === undefined
                 ? '— / — '
                 : `${tokShown === undefined ? '—' : fmtTokens(tokShown)} / ${fmtTokens(ctx.window)} `}
             </Text>
-            <Text color={thresholdColor(pct)} weight="semibold">
+            <Text color={hotColor(pct)} weight="semibold">
               {pctText(pctShown)}
             </Text>
           </Text>,
         )}
-        {drawCells(ui, contextCells(W, pctShown, breakdown, ctx?.window ?? 0, isWorking ? frame.n : undefined))}
+        {drawCells(
+          ui,
+          contextCells(W, pctShown, breakdown, ctx?.window ?? 0, isWorking ? frame.n : undefined, hotColor(pct)),
+        )}
         {legend.length > 0 && (
           <Text wrap="truncate-end" size="footnote">
             {legend.map(s => (
@@ -1283,12 +1934,39 @@ export const register: Register = (on, options) => {
             ))}
           </Text>
         )}
+        {(note !== undefined || showsCompact) && (
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+            <Box flexGrow={1} flexShrink={1} minWidth={0}>
+              <Text color={note?.startsWith('compacted') === true ? C.teal : C.overlay0} size="footnote" wrap="truncate-end">
+                {note ?? ' '}
+              </Text>
+            </Box>
+            {showsCompact && (
+              <Button
+                key="compact"
+                plain
+                dimColor={!isArmed}
+                label={isArmed ? 'press again to compact' : 'compact now'}
+                onPress={() => pressCompact($)}
+              />
+            )}
+          </Box>
+        )}
         {gap(ui)}
 
         {metricRow(ui, look, 'cache', 'CACHE', C.teal, [
           <Text color={hitColor} weight="semibold" tabular>
             {hit === undefined ? '—' : `${hit}% hit`}
           </Text>,
+          warmLeft === undefined ? (
+            <Text> </Text>
+          ) : warmLeft <= 0 ? (
+            <Text color={mix(C.red, C.overlay0, 0.4)}>{'  cold'}</Text>
+          ) : warmLeft < CACHE_LAST_MINUTE_MS ? (
+            <Text color={C.yellow} tabular>{`  warm ${fmtClock(warmLeft)}`}</Text>
+          ) : (
+            <Text color={C.teal} tabular>{`  warm ${fmtSpan(warmLeft)}`}</Text>
+          ),
           <Text color={C.overlay0} tabular>{`  R ${fmtTokens(totals.cacheRead)}  W ${fmtTokens(totals.cacheWrite)}`}</Text>,
         ])}
         {metricRow(ui, look, 'tokens', 'TOKENS', C.blue, [
@@ -1306,17 +1984,24 @@ export const register: Register = (on, options) => {
             ].join('')}
           </Text>,
         ])}
+        {showsSpend &&
+          metricRow(ui, look, 'spend', 'SPEND', C.yellow, [
+            <Text color={C.yellow} weight="semibold" tabular>{`today ${fmtUsd(spent.today)}`}</Text>,
+            <Text color={C.overlay0} tabular>{`  wk ${fmtUsd(spent.week)}  `}</Text>,
+            ...runs(sparkCells(spent.days, 7)).map(r => <Text color={r.color}>{r.ch}</Text>),
+          ])}
 
         {limits.length > 0 && gap(ui)}
         {limits.length > 0 && sectionHeader(ui, look, 'limits', 'LIMITS', C.sapphire)}
         {limits.map(l => {
           const burn = burnFor(samples[l.kind], l.percentUsed, l.resetsAt, clock)
           const resetIn = l.resetsAt === undefined ? undefined : Date.parse(l.resetsAt) - clock
+          const color = hotColor(l.percentUsed)
           return (
             <Box flexDirection="row" alignItems="center">
               <Text color={C.subtext} wrap="truncate-end">{shortKind(l.kind).padEnd(3)}</Text>
-              {drawCells(ui, barCells(limitBarW, l.percentUsed, thresholdColor(l.percentUsed)))}
-              <Text color={thresholdColor(l.percentUsed)} weight="semibold" wrap="truncate-end" tabular>{` ${pctText(l.percentUsed).padStart(4)}`}</Text>
+              {drawCells(ui, barCells(limitBarW, l.percentUsed, color))}
+              <Text color={color} weight="semibold" wrap="truncate-end" tabular>{` ${pctText(l.percentUsed).padStart(4)}`}</Text>
               {resetIn !== undefined && !Number.isNaN(resetIn) && iconLabel(ui, look, 'reset', C.overlay0, fmtSpan(resetIn), 2)}
               {burn !== undefined &&
                 (burn.isShort ? (
@@ -1343,14 +2028,17 @@ export const register: Register = (on, options) => {
         {recent.map(a => {
           const glyph = statusGlyph(a.status, frame.n, look.pie)
           const ms = a.status === 'running' ? clock - a.startedAt : (a.durationMs ?? 0)
+          // a new row lights up and fades to its colours over the first second
+          const age = frame.at - a.startedAt
+          const glow = isWorking && age >= 0 && age < FLASH_MS ? 1 - age / FLASH_MS : 0
           return (
             <Box flexDirection="row">
               <Text color={glyph.color}>{`${glyph.ch} `}</Text>
-              <Text color={C.blue} weight={a.status === 'running' ? 'semibold' : 'regular'}>
+              <Text color={glow > 0 ? mix(C.blue, C.text, glow) : C.blue} weight={a.status === 'running' ? 'semibold' : 'regular'}>
                 {toolName(a.tool).padEnd(8)}
               </Text>
               <Box flexGrow={1} flexShrink={1} minWidth={0}>
-                <Text color={C.subtext} wrap="truncate-end">
+                <Text color={glow > 0 ? mix(C.subtext, C.text, glow) : C.subtext} wrap="truncate-end">
                   {a.summary}
                 </Text>
               </Box>
@@ -1371,8 +2059,8 @@ export const register: Register = (on, options) => {
           <Text color={C.overlay0}>no activity yet</Text>
         )}
 
-        {(git !== null || todos.length > 0) && gap(ui)}
-        {git !== null && (
+        {(showsGit || changed.length > 0 || todos.length > 0) && gap(ui)}
+        {showsGit && git !== null && (
           <Box flexDirection="row" alignItems="center">
             {icon(ui, look, 'branch', C.green)}
             <Text wrap="truncate-end" size="footnote">
@@ -1385,6 +2073,42 @@ export const register: Register = (on, options) => {
               <Text color={C.overlay0}>{git.files > 0 ? ` · ${git.files} files` : ' · clean'}</Text>
             </Text>
           </Box>
+        )}
+        {!showsGit && changed.length > 0 && (
+          <Box flexDirection="row" alignItems="center">
+            {icon(ui, look, 'files', C.green)}
+            <Text color={C.green} weight="semibold" size="footnote" wrap="truncate-end">
+              {` ${changed.length} file${changed.length === 1 ? '' : 's'} edited`}
+            </Text>
+          </Box>
+        )}
+        {changed.slice(0, SHOWN_FILES).map(f => {
+          const stat = statFor(f.path, git?.fileStats)
+          return (
+            <Box flexDirection="row" alignItems="center">
+              <Box flexGrow={1} flexShrink={1} minWidth={0}>
+                <Text color={C.subtext} size="footnote" wrap="truncate-end">
+                  {`  ${basename(f.path)}`}
+                </Text>
+              </Box>
+              <Box flexShrink={0}>
+                <Text size="footnote" wrap="truncate-end" tabular>
+                  {stat === 'new' && <Text color={C.green}>{' new'}</Text>}
+                  {stat !== undefined && stat !== 'new' && stat.added + stat.removed > 0 && (
+                    <Text>
+                      <Text color={C.green}>{` +${stat.added}`}</Text>
+                      <Text color={C.red}>{` −${stat.removed}`}</Text>
+                    </Text>
+                  )}
+                </Text>
+              </Box>
+            </Box>
+          )
+        })}
+        {changed.length > SHOWN_FILES && (
+          <Text color={C.overlay0} size="footnote">
+            {`  +${changed.length - SHOWN_FILES} more`}
+          </Text>
         )}
         {todos.length > 0 && (
           <Box flexDirection="row" alignItems="center">
@@ -1401,24 +2125,32 @@ export const register: Register = (on, options) => {
         )}
 
         {gap(ui)}
-        <Button
-          key="toggle-band"
-          plain
-          dimColor
-          label={bandHidden ? 'show activity band' : 'hide activity band'}
-          onPress={() => update($, bandHiddenAtom, v => !v)}
-        />
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Button
+            key="open-settings"
+            plain
+            dimColor
+            label={`${icons.gear} settings`}
+            onPress={() => update($, paneViewAtom, () => 'settings')}
+          />
+          {versionLine !== '' && (
+            <Text color={C.overlay0} size="footnote" wrap="truncate-end">
+              {versionLine}
+            </Text>
+          )}
+        </Box>
       </Box>
     )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!e.props.isWorking || e.props.hasSurvey) return next(e)
-    if (await read($, bandHiddenAtom)) return next(e)
+    const settings = settingsFor(await read($, settingsAtom), e.surface)
+    if (!settings.band) return next(e)
 
     const ui: Ui = $.ui.resolve(e)
     const { Box, Text } = ui
-    const look = lookFor(e.surface, opts.icons)
+    const look = lookFor(e.surface, iconChoice(e.surface, settings))
     const { icons } = look
     const [activity, frame, work, stream, agents] = await Promise.all([
       read($, activityAtom),

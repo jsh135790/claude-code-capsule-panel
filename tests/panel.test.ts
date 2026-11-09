@@ -1,4 +1,4 @@
-import type { On, RenderPropsOf, UiPane } from 'claude-code'
+import type { On, RenderPropsOf, RenderSurface, UiPane } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 const PANE_PROPS: RenderPropsOf['Pane'] = {
@@ -26,6 +26,9 @@ const WORKING_BAND = { ...BAND, props: { ...BAND_PROPS, isWorking: true } } as c
 const GREEN = '#a6e3a1'
 const RED = '#f38ba8'
 const MAUVE = '#cba6f7'
+const BLUE = '#89b4fa'
+const TEAL = '#94e2d5'
+const YELLOW = '#f9e2af'
 const MINUTE = 60_000
 
 // Nerd Font glyphs live in the private use areas; nothing else here does.
@@ -36,33 +39,86 @@ const PUA = new RegExp(
 // block elements: sparkline bars and pixel art, none of which the band draws now
 const BLOCKS = /[▀-▟]/
 
+type EngineOptions = {
+  /** `git status --porcelain=v2 --branch` output; no repository when not given. */
+  git?: string
+  /** `git diff --numstat HEAD` output. */
+  numstat?: string
+  /** What the plugin's store holds at the start. */
+  store?: Record<string, unknown>
+  env?: Record<string, string>
+  surfaces?: RenderSurface[]
+  /** The auto-compact threshold the context breakdown reports. */
+  threshold?: number
+}
+
 // Hooks beneath the plugin that stand for the engine, so every event the
 // plugin passes on with next(e) settles in the test host.
-const engine = (on: On, panes: UiPane[] = [], opts: { git?: string } = {}) => {
+const engine = (on: On, panes: UiPane[] = [], opts: EngineOptions = {}) => {
   const closed: string[] = []
   const toasts: string[] = []
   const played: string[] = []
+  const runs: string[][] = []
+  const notes: { text: string; title?: string }[] = []
+  const compacts: string[] = []
+  const store: Record<string, unknown> = { ...opts.store }
+  const env = opts.env ?? {}
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.compact', ($, e) => {
+    // the kit raises a plugin's compaction with the call's own arguments: no trigger, no messages
+    compacts.push(String(e.trigger))
+    return {
+      messages: [{ role: 'user', text: 'Summary of the conversation so far.', toolUses: [] }],
+      tokensBefore: 180_000,
+      tokensAfter: 32_000,
+    }
+  })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.usage', () => ({
-    value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] },
+    value: {
+      startedAt: 0,
+      context: {
+        window: 1_000_000,
+        breakdown:
+          opts.threshold === undefined ? undefined : ({ categories: [], autoCompactThreshold: opts.threshold } as never),
+      },
+      rateLimits: [],
+    },
   }))
   on('session.model', () => ({ value: 'claude-test-1' }))
   on('session.cwd', () => ({ value: 'C:/work' }))
+  on('session.surfaces', () => ({ value: opts.surfaces ?? ['terminal'] }))
+  on('session.version', () => ({ value: { version: '2.1.317', base: '2.1.317' } }))
   on('agent.list', () => ({ value: [] }))
+  on('env.get', ($, e) => ({ value: env[e.name] }))
+  on('store.get', ($, e) => ({ value: store[e.key] }))
+  on('store.set', ($, e) => {
+    store[e.key] = e.value
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    delete store[e.key]
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(store) }))
+  on('ui.notify', ($, e) => {
+    notes.push({ text: e.text, title: e.title })
+    return { value: { isSent: true, channel: 'kitty' } }
+  })
   on('process.run', ($, e) => {
-    const isStatus = e.argv.includes('status')
-    const out = opts.git === undefined ? undefined : isStatus ? opts.git : ''
-    return {
-      value:
-        out === undefined
-          ? { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false }
-          : { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    runs.push([...e.argv])
+    const ok = (stdout: string) => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+    if (e.argv[0] !== 'git') return { value: ok('') }
+    if (opts.git === undefined) {
+      return {
+        value: { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false },
+      }
     }
+    return { value: ok(e.argv.includes('status') ? opts.git : (opts.numstat ?? '')) }
   })
   on('ui.open', () => ({ value: { isPlaced: false, reason: 'test' } }))
   on('ui.panes', () => ({ value: panes }))
@@ -79,8 +135,11 @@ const engine = (on: On, panes: UiPane[] = [], opts: { git?: string } = {}) => {
     return { value: undefined }
   })
   on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Box' }))
-  return { closed, toasts, played }
+  return { closed, toasts, played, runs, notes, compacts, store }
 }
+
+/** Local noon (or the given hour and minute) on a day of November 2026. */
+const nov = (day: number, hour = 12, minute = 0) => new Date(2026, 10, day, hour, minute).getTime()
 
 const measure = (percent: number, extra: { costUsd?: number; limits?: { pct: number; resetsAt: string }[] } = {}) => ({
   context: { tokens: percent * 10_000, window: 1_000_000, percent },
@@ -169,9 +228,11 @@ test('the desktop draws each capsule as an SVG with round ends', async ($, on) =
   await ui.unmount()
 })
 
-test('icons: unicode drops the Nerd Font glyphs in the terminal too', { options: { icons: 'unicode' } }, async ($, on) => {
-  engine(on)
-  mock.clock(on, { now: 1_000_000 })
+test('the terminal icon setting can drop the Nerd Font glyphs', async ($, on) => {
+  engine(on, [], { store: { 'settings.terminal': { icons: 'unicode' } } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.findAll({ type: 'Text' })).some(t => PUA.test(t.text))).toBe(false)
   expect(await ui.find({ type: 'Text', text: /^◧$/ })).toBeDefined()
@@ -451,18 +512,81 @@ test('the band keeps to one line: only the detail gives way', async ($, on) => {
   }
 })
 
-test('the pane button hides the band', async ($, on) => {
-  engine(on)
+test('the settings page changes one surface, and the store keeps it', async ($, on) => {
+  const { store } = engine(on)
   const clock = mock.clock(on, { now: 1_000_000 })
-  await $.turn.start({ text: 'go', turnId: 't1' })
-  await clock.advance(240)
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
   const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await pane.press({ key: 'toggle-band' })
+  await pane.press({ key: 'open-settings' })
+  await pane.redraw()
+  // a whole page of its own: the dashboard steps aside
+  expect(await pane.find({ type: 'Text', text: /CONTEXT/ })).toBeUndefined()
+  expect(await pane.find({ type: 'Text', text: /^Activity band$/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /the terminal only/ })).toBeDefined()
+  expect((await pane.find({ key: 'set-band' }))?.props.label).toBe('on')
+  expect((await pane.find({ key: 'set-cacheTtl' }))?.props.label).toBe('auto (1h)')
+  expect(await pane.find({ key: 'set-icons' })).toBeDefined()
+
+  await pane.press({ key: 'set-band' })
+  await pane.press({ key: 'set-notifyAfterS' })
+  await clock.settle()
+  await pane.redraw()
+  expect((await pane.find({ key: 'set-band' }))?.props.label).toBe('off')
+  expect((await pane.find({ key: 'set-notifyAfterS' }))?.props.label).toBe('120s')
+  expect(store['settings.terminal']).toEqual(expect.objectContaining({ band: false, notifyAfterS: 120 }))
+  expect(store['settings.desktop']).toBeUndefined()
+
+  await pane.press({ key: 'settings-back' })
+  await pane.redraw()
+  expect(await pane.find({ type: 'Text', text: /CONTEXT/ })).toBeDefined()
   await pane.unmount()
 
-  const band = await $.ui.mount({ ...WORKING_BAND, surface: 'terminal' })
-  expect(await band.find({ type: 'Text', text: /thinking/ })).toBeUndefined()
-  await band.unmount()
+  // the band goes in the terminal and stays on the desktop
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await clock.advance(240)
+  const terminal = await $.ui.mount({ ...WORKING_BAND, surface: 'terminal' })
+  expect(await terminal.find({ type: 'Text', text: /thinking/ })).toBeUndefined()
+  await terminal.unmount()
+  const desktop = await $.ui.mount({ ...WORKING_BAND, surface: 'desktop' })
+  expect((await desktop.find({ type: 'Svg' }))?.props.alt).toBe('thinking')
+  const settings = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await settings.press({ key: 'open-settings' })
+  await settings.redraw()
+  expect(await settings.find({ key: 'set-icons' })).toBeUndefined()
+  expect(await settings.find({ type: 'Text', text: /Claude Desktop only/ })).toBeDefined()
+  await desktop.unmount()
+  await settings.unmount()
+})
+
+test('Claude Desktop starts with the sound and the notification off', async ($, on) => {
+  const { played, runs } = engine(on, [], { surfaces: ['desktop'], env: { OS: 'Windows_NT' } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...complete('t1'), durationMs: 5 * MINUTE })
+  await clock.settle()
+  expect(played).toEqual([])
+  expect(runs.some(argv => argv[0] === 'powershell')).toBe(false)
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await pane.press({ key: 'open-settings' })
+  await pane.redraw()
+  expect((await pane.find({ key: 'set-sound' }))?.props.label).toBe('off')
+  expect((await pane.find({ key: 'set-notify' }))?.props.label).toBe('off')
+  await pane.unmount()
+})
+
+test('a stored setting comes back in the next session', async ($, on) => {
+  const { played } = engine(on, [], { surfaces: ['desktop'], store: { 'settings.desktop': { sound: true } } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(complete('t1'))
+  await clock.settle()
+  expect(played).toEqual(['assets/done.wav'])
 })
 
 test('a completed turn plays the done sound', async ($, on) => {
@@ -474,9 +598,11 @@ test('a completed turn plays the done sound', async ($, on) => {
   expect(played).toEqual(['assets/done.wav'])
 })
 
-test('sound: false keeps a completed turn quiet', { options: { sound: false } }, async ($, on) => {
-  const { played } = engine(on)
+test('the sound setting turned off keeps a completed turn quiet', async ($, on) => {
+  const { played } = engine(on, [], { store: { 'settings.terminal': { sound: false } } })
   const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
   await $.turn.start({ text: 'go', turnId: 't1' })
   await $.turn.complete(complete('t1'))
   await clock.settle()
@@ -524,5 +650,281 @@ test('a /clear resets the figures to placeholders', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /— \/ —/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^43%$/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the header names the model and effort, the footer the versions', async ($, on) => {
+  engine(on, [], { env: { CLAUDE_EFFORT: 'xhigh', CLAUDE_CODE_DESKTOP_APP_VERSION: '4.23118.0' } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^ test-1 · xhigh$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^CC 2\.1\.317 · Desktop 4\.23118\.0$/ })).toBeDefined()
+
+  await ui.press({ key: 'open-settings' })
+  await ui.press({ key: 'set-versions' })
+  await ui.press({ key: 'settings-back' })
+  await clock.settle()
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^CC / })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the cache row counts down to cold', async ($, on) => {
+  // no key in the environment: a subscriber, whose cache lasts an hour
+  engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /warm|cold/ })).toBeUndefined()
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(complete('t1'))
+  await clock.advance(1_000)
+  await ui.redraw()
+  expect((await ui.find({ type: 'Text', text: /^ {2}warm 1h00m$/ }))?.props.color).toBe(TEAL)
+
+  await clock.advance(59 * MINUTE + 29_000)
+  await ui.redraw()
+  expect((await ui.find({ type: 'Text', text: /^ {2}warm 0:30$/ }))?.props.color).toBe(YELLOW)
+
+  await clock.advance(MINUTE)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^ {2}cold$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a key in the environment makes the cache 5 minutes, and the TTL setting overrides it', async ($, on) => {
+  engine(on, [], { env: { ANTHROPIC_AUTH_TOKEN: 'test-token' } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(complete('t1'))
+  await clock.advance(1_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^ {2}warm 5m$/ })).toBeDefined()
+
+  await ui.press({ key: 'open-settings' })
+  await ui.redraw()
+  expect((await ui.find({ key: 'set-cacheTtl' }))?.props.label).toBe('auto (5m)')
+  await ui.press({ key: 'set-cacheTtl' })
+  await ui.press({ key: 'set-cacheTtl' })
+  await clock.settle()
+  await ui.redraw()
+  expect((await ui.find({ key: 'set-cacheTtl' }))?.props.label).toBe('1h')
+  await ui.press({ key: 'settings-back' })
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^ {2}warm 1h00m$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('spend adds up every session today and this week, and turns over at midnight', async ($, on) => {
+  const { store } = engine(on, [], {
+    store: {
+      'spend/2026-11-11/other': 3,
+      'spend/2026-11-10/other': 2,
+      // last Sunday: in the last seven days, not in this week
+      'spend/2026-11-08/other': 4,
+      // past the two weeks kept
+      'spend/2026-10-20/old': 9,
+    },
+  })
+  // a Wednesday, ten minutes to midnight
+  const clock = mock.clock(on, { now: nov(11, 23, 50) })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(store['spend/2026-10-20/old']).toBeUndefined()
+
+  await $.session.measure(measure(10, { costUsd: 1.5 }))
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^today \$4\.50$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}wk \$6\.50 {2}$/ })).toBeDefined()
+  const mine = () =>
+    Object.entries(store)
+      .filter(([k]) => /^spend\/2026-11-1[12]\//.test(k) && !k.endsWith('/other'))
+      .map(([k, v]) => `${k.slice(6, 16)} ${String(v)}`)
+  expect(mine()).toEqual(['2026-11-11 1.5'])
+
+  // past midnight the session's cost books to the new day, from what it had spent
+  await clock.set(nov(12, 0, 10))
+  await $.session.measure(measure(10, { costUsd: 2 }))
+  await clock.settle()
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /^today \$0\.50$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}wk \$7\.00 {2}$/ })).toBeDefined()
+  expect(mine()).toEqual(['2026-11-11 1.5', '2026-11-12 0.5'])
+  await ui.unmount()
+})
+
+test('the forecast counts turns to the auto-compact, and compact now takes two presses', async ($, on) => {
+  const { compacts } = engine(on, [], { threshold: 160_000 })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  // 40k, 60k, 80k: 20k a turn, with 80k left before 160k
+  for (const [i, pct] of [4, 6, 8].entries()) {
+    await $.session.measure(measure(pct))
+    await $.turn.complete(complete(`t${i}`))
+  }
+  await clock.advance(1_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^≈4 turns to auto-compact$/ })).toBeDefined()
+  const label = async () => (await ui.find({ key: 'compact' }))?.props.label
+  expect(await label()).toBe('compact now')
+
+  // one press arms it for a few seconds, and lapses
+  await ui.press({ key: 'compact' })
+  await ui.redraw()
+  expect(await label()).toBe('press again to compact')
+  await clock.advance(3_500)
+  await ui.redraw()
+  expect(await label()).toBe('compact now')
+  expect(compacts).toEqual([])
+
+  await ui.press({ key: 'compact' })
+  await ui.press({ key: 'compact' })
+  await clock.settle()
+  await ui.redraw()
+  expect(compacts.length).toBe(1)
+  expect(await ui.find({ type: 'Text', text: /^compacted 180k → 32k$/ })).toBeDefined()
+
+  await clock.advance(16 * MINUTE)
+  await ui.redraw()
+  expect(await ui.find({ type: 'Text', text: /compacted/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a long turn raises a Windows toast, and a short one nothing', async ($, on) => {
+  const { runs, notes } = engine(on, [], { env: { OS: 'Windows_NT' } })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const toasts = () => runs.filter(argv => argv[0] === 'powershell')
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...complete('t1'), answer: 'quick', durationMs: 5_000 })
+  await clock.settle()
+  expect(toasts()).toEqual([])
+
+  await $.turn.start({ text: 'go', turnId: 't2' })
+  await $.turn.complete({ ...complete('t2'), answer: "All 31 tests pass. It's done.", durationMs: 90_000 })
+  await clock.settle()
+  expect(toasts().length).toBe(1)
+  const argv = toasts()[0] ?? []
+  expect(argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
+  expect(argv[4]).toMatch(/CreateTextNode\('Claude Code · work'\)/)
+  // a single quote doubles inside PowerShell's single-quoted string
+  expect(argv[4]).toMatch(/CreateTextNode\('done in 1m30s · All 31 tests pass\. It''s done\.'\)/)
+  expect(argv[4]).toMatch(/ToastText02/)
+
+  // an interrupted turn is no news
+  await $.turn.start({ text: 'go', turnId: 't3' })
+  await $.turn.complete({ ...complete('t3'), isAborted: true, reason: 'aborted' as const, durationMs: 90_000 })
+  await clock.settle()
+  expect(toasts().length).toBe(1)
+  expect(notes).toEqual([])
+})
+
+test('off Windows the notification goes through the notification channel', async ($, on) => {
+  const { runs, notes } = engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...complete('t1'), answer: 'Done.', durationMs: 2 * MINUTE })
+  await clock.settle()
+  expect(notes).toEqual([{ text: 'done in 2m00s · Done.', title: 'Claude Code · work' }])
+  expect(runs.some(argv => argv[0] === 'powershell')).toBe(false)
+})
+
+test('changed files list the newest five with their lines, then a count', async ($, on) => {
+  engine(on, [], {
+    git: '# branch.oid abc\n# branch.head main\n1 .M N... 100644 100644 100644 a b src/a.ts\n? src/new.ts\n',
+    numstat: '3\t1\tsrc/a.ts\n',
+  })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', () => ({ result: {}, text: 'ok' }))
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  for (const name of ['b1', 'b2', 'b3', 'b4', 'b5', 'new', 'a']) {
+    await $.tool.call({ tool: 'Edit', file_path: `C:\\work\\src\\${name}.ts`, old_string: 'x', new_string: 'y' })
+  }
+  // an edit made twice is listed once, as the newest
+  await $.tool.call({ tool: 'Write', file_path: 'C:/work/src/a.ts', content: 'z' })
+  await clock.advance(2_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const rows = (await ui.findAll({ type: 'Text', text: /^ {2}\S+\.ts$/ })).map(t => t.text.trim())
+  expect(rows).toEqual(['a.ts', 'new.ts', 'b5.ts', 'b4.ts', 'b3.ts'])
+  expect(await ui.find({ type: 'Text', text: /^ \+3$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ −1$/ })).toBeDefined()
+  // the row's outer Text holds the same words: the coloured one is inside it
+  expect((await ui.findAll({ type: 'Text', text: /^ new$/ })).some(t => t.props.color === GREEN)).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /^ {2}\+2 more$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('outside a repository the edits still count, and the git setting hides them', async ($, on) => {
+  engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', () => ({ result: {}, text: 'ok' }))
+  await $.session.start({ cwd: 'C:/work', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  await $.tool.call({ tool: 'Write', file_path: 'C:/work/notes.md', content: 'z' })
+  await clock.advance(2_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^ 1 file edited$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}notes\.md$/ })).toBeDefined()
+
+  await ui.press({ key: 'open-settings' })
+  await ui.press({ key: 'set-git' })
+  await ui.press({ key: 'settings-back' })
+  await clock.settle()
+  await ui.redraw()
+  // the activity row keeps its own note of the write
+  expect(await ui.find({ type: 'Text', text: /^ {2}notes\.md$|file edited/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a new activity row lights up and fades within a second', async ($, on) => {
+  engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', () => ({ result: {}, text: 'ok' }))
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await clock.advance(240)
+  await $.tool.call({ tool: 'Read', file_path: 'C:/work/a.ts' })
+  await clock.advance(240)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const color = async () => (await ui.find({ type: 'Text', text: /^Read {4}$/ }))?.props.color
+  expect(await color()).not.toBe(BLUE)
+  await clock.advance(1_200)
+  await ui.redraw()
+  expect(await color()).toBe(BLUE)
+  await ui.unmount()
+})
+
+test('a figure at 80% or more breathes red while Claude works, and holds still after', async ($, on) => {
+  engine(on)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.session.measure(measure(92))
+  await clock.advance(1_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const color = async () => String((await ui.find({ type: 'Text', text: /^92%$/ }))?.props.color)
+  const seen = new Set<string>()
+  for (let i = 0; i < 8; i++) {
+    await clock.advance(120)
+    await ui.redraw()
+    seen.add(await color())
+  }
+  expect(seen.size).toBeGreaterThan(2)
+
+  await $.turn.complete(complete('t1'))
+  await clock.advance(1_000)
+  await ui.redraw()
+  expect(await color()).toBe(RED)
   await ui.unmount()
 })
